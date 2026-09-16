@@ -30,6 +30,7 @@ from cloudguard.api_schemas import (
     ReviewResponse,
     ReviewSubmission,
 )
+from cloudguard.iac import IaCDocument, IaCInput
 from cloudguard.pipeline import (
     PipelineFailureKind,
     ReviewPipeline,
@@ -40,7 +41,7 @@ from cloudguard.repository import (
     ReviewRepository,
     StoredReview,
 )
-from cloudguard.terraform import TerraformParser
+from cloudguard.terraform import TerraformAdapter, TerraformParser
 
 DEFAULT_MAX_REQUEST_BYTES = 2_100_000
 _CORRELATION_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
@@ -112,7 +113,10 @@ def create_app(
     parser = TerraformParser(
         max_input_bytes=min(max_request_bytes, 2_000_000)
     )
-    pipeline = ReviewPipeline(repository, parser=parser)
+    pipeline = ReviewPipeline(
+        repository,
+        TerraformAdapter(parser),
+    )
     app = FastAPI(
         title="CloudGuard Local API",
         version="0.1.0",
@@ -252,15 +256,30 @@ def create_app(
             max_length=128,
         ),
     ) -> ReviewResponse:
-        content_bytes = submission.content.encode("utf-8")
-        if len(content_bytes) > parser.max_input_bytes:
-            raise HTTPException(413, "Terraform content is too large")
-        canonical = json.dumps(
-            {
-                "filename": submission.filename,
-                "content": submission.content,
+        try:
+            iac_input = _iac_input(submission)
+        except ValueError as error:
+            if "exceeds" in str(error):
+                raise HTTPException(413, "IaC content is too large") from error
+            raise HTTPException(422, "IaC input is invalid") from error
+        canonical_payload: dict[str, object]
+        if submission.documents is None:
+            canonical_payload = {
+                "filename": iac_input.documents[0].name,
+                "content": iac_input.documents[0].content,
                 "rule_states": submission.rule_states,
-            },
+            }
+        else:
+            canonical_payload = {
+                "format": submission.format,
+                "documents": [
+                    {"filename": item.name, "content": item.content}
+                    for item in iac_input.documents
+                ],
+                "rule_states": submission.rule_states,
+            }
+        canonical = json.dumps(
+            canonical_payload,
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
@@ -276,8 +295,7 @@ def create_app(
                     correlation_id=_correlation_id.get(),
                     idempotency_key=key,
                     request_hash=request_hash,
-                    filename=submission.filename,
-                    content=submission.content,
+                    iac_input=iac_input,
                     rule_states=submission.rule_states,
                 )
             )
@@ -354,6 +372,19 @@ def create_app(
         return HealthResponse(status="ok", persistence="ok")
 
     return app
+
+
+def _iac_input(submission: ReviewSubmission) -> IaCInput:
+    if submission.documents is not None:
+        documents = tuple(
+            IaCDocument(item.filename, item.content)
+            for item in submission.documents
+        )
+    else:
+        assert submission.filename is not None
+        assert submission.content is not None
+        documents = (IaCDocument(submission.filename, submission.content),)
+    return IaCInput(documents)
 
 
 def _review_response(stored: StoredReview) -> ReviewResponse:

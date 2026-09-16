@@ -5,26 +5,72 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 
 class StrictSchema(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
 
-class ReviewSubmission(StrictSchema):
+class IaCDocumentSubmission(StrictSchema):
     filename: str = Field(min_length=3, max_length=255)
     content: str = Field(min_length=1)
-    rule_states: dict[str, bool] = Field(default_factory=dict)
 
     @field_validator("filename")
     @classmethod
     def validate_filename(cls, value: str) -> str:
-        if "\x00" in value or "/" in value or "\\" in value:
-            raise ValueError("filename must not contain path components")
-        if not value.lower().endswith(".tf"):
-            raise ValueError("only .tf Terraform files are accepted")
+        return _terraform_filename(value)
+
+
+class ReviewSubmission(StrictSchema):
+    format: str = "terraform"
+    filename: str | None = Field(default=None, min_length=3, max_length=255)
+    content: str | None = Field(default=None, min_length=1)
+    documents: list[IaCDocumentSubmission] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+    )
+    rule_states: dict[str, bool] = Field(default_factory=dict)
+
+    @field_validator("format")
+    @classmethod
+    def validate_format(cls, value: str) -> str:
+        if value != "terraform":
+            raise ValueError("unsupported IaC format")
         return value
+
+    @field_validator("filename")
+    @classmethod
+    def validate_filename(cls, value: str | None) -> str | None:
+        return _terraform_filename(value) if value is not None else None
+
+    @model_validator(mode="after")
+    def validate_input_shape(self) -> ReviewSubmission:
+        has_single = self.filename is not None or self.content is not None
+        has_documents = self.documents is not None
+        if has_single and has_documents:
+            raise ValueError("provide filename/content or documents, not both")
+        if has_single:
+            if self.filename is None or self.content is None:
+                raise ValueError("filename and content must be provided together")
+        elif not has_documents:
+            raise ValueError("an IaC document is required")
+        return self
+
+
+def _terraform_filename(value: str) -> str:
+    if "\x00" in value or "/" in value or "\\" in value:
+        raise ValueError("filename must not contain path components")
+    if not value.lower().endswith(".tf"):
+        raise ValueError("only .tf Terraform files are accepted")
+    return value
 
 
 class DiagnosticResponse(StrictSchema):
@@ -77,4 +123,3 @@ class HealthResponse(StrictSchema):
 class ErrorResponse(StrictSchema):
     detail: str
     correlation_id: str
-

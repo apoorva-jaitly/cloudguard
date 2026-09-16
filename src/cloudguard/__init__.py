@@ -71,6 +71,14 @@ from cloudguard.facts import (
     ReconciliationStatus,
     UnknownFact,
 )
+from cloudguard.iac import (
+    IaCAdapter,
+    IaCDiagnostic,
+    IaCDiagnosticSeverity,
+    IaCDocument,
+    IaCInput,
+    IaCParseResult,
+)
 from cloudguard.reports import GeneratedReports, ReportGenerator
 from cloudguard.rules import (
     RuleDefinition,
@@ -80,6 +88,7 @@ from cloudguard.rules import (
 )
 from cloudguard.terraform import (
     DiagnosticSeverity,
+    TerraformAdapter,
     TerraformDiagnostic,
     TerraformModule,
     TerraformParser,
@@ -127,6 +136,12 @@ __all__ = [
     "Finding",
     "FindingStatus",
     "GeneratedReports",
+    "IaCAdapter",
+    "IaCDiagnostic",
+    "IaCDiagnosticSeverity",
+    "IaCDocument",
+    "IaCInput",
+    "IaCParseResult",
     "NormalizedFacts",
     "ObservedFact",
     "Pillar",
@@ -153,6 +168,7 @@ __all__ = [
     "RuleEngineConfig",
     "RuleEvaluation",
     "Severity",
+    "TerraformAdapter",
     "TerraformDiagnostic",
     "TerraformModule",
     "TerraformParseResult",

@@ -13,20 +13,28 @@ import math
 import os
 import re
 import stat
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Final, Mapping
+from typing import Final
 
 from cloudguard.domain import (
-    AWSResource,
     Architecture,
+    AWSResource,
     Evidence,
     EvidenceType,
     JsonValue,
     RelationshipType,
     ResourceRelationship,
+)
+from cloudguard.iac import (
+    IaCAdapter,
+    IaCDiagnostic,
+    IaCDiagnosticSeverity,
+    IaCInput,
+    IaCParseResult,
 )
 
 _MAX_INPUT_BYTES: Final = 2_000_000
@@ -108,7 +116,7 @@ class _Block:
     block_type: str
     labels: tuple[str, ...]
     attributes: tuple[_Attribute, ...]
-    children: tuple["_Block", ...]
+    children: tuple[_Block, ...]
     start: _Token
     end: _Token
 
@@ -548,7 +556,7 @@ class TerraformParser:
             )
         except _LimitExceeded as error:
             return self._empty_result(filename, str(error))
-        except Exception:
+        except Exception:  # noqa: BLE001 - hostile input must become a diagnostic
             # Parser defects or hostile edge cases must not escape as input-driven
             # crashes. The generic diagnostic deliberately excludes internals.
             return self._empty_result(filename, "unable to parse Terraform input")
@@ -707,6 +715,115 @@ class TerraformParser:
                     DiagnosticSeverity.ERROR, message, f"{filename}:1:1"
                 ),
             ),
+        )
+
+
+class TerraformAdapter(IaCAdapter):
+    """Adapt one or more Terraform source documents to normalized IaC output."""
+
+    def __init__(self, parser: TerraformParser | None = None) -> None:
+        self.parser = parser or TerraformParser()
+
+    @property
+    def adapter_id(self) -> str:
+        return "terraform-hcl"
+
+    def parse(self, iac_input: IaCInput) -> IaCParseResult:
+        if not isinstance(iac_input, IaCInput):
+            raise TypeError("iac_input must be an IaCInput")
+
+        resources: list[AWSResource] = []
+        relationships: list[ResourceRelationship] = []
+        evidence: list[Evidence] = []
+        diagnostics: list[IaCDiagnostic] = []
+        resource_ids: set[str] = set()
+        relationship_ids: set[str] = set()
+
+        for document in iac_input.documents:
+            parsed = self.parser.parse_text(
+                document.content,
+                filename=document.name,
+            )
+            document_duplicate_ids: set[str] = set()
+            diagnostics.extend(
+                IaCDiagnostic(
+                    (
+                        IaCDiagnosticSeverity.ERROR
+                        if item.severity is DiagnosticSeverity.ERROR
+                        else IaCDiagnosticSeverity.WARNING
+                    ),
+                    item.message,
+                    item.source_location,
+                    self.adapter_id,
+                )
+                for item in parsed.diagnostics
+            )
+            for resource in parsed.architecture.resources:
+                if resource.id in resource_ids:
+                    document_duplicate_ids.add(resource.id)
+                    diagnostics.append(
+                        IaCDiagnostic(
+                            IaCDiagnosticSeverity.ERROR,
+                            f"duplicate resource identity: {resource.id}",
+                            resource.source_location or document.name,
+                            self.adapter_id,
+                        )
+                    )
+                    continue
+                resource_ids.add(resource.id)
+                resources.append(resource)
+            for relationship in parsed.architecture.relationships:
+                if (
+                    relationship.source_resource_id in document_duplicate_ids
+                    or relationship.target_resource_id in document_duplicate_ids
+                ):
+                    continue
+                if relationship.id in relationship_ids:
+                    diagnostics.append(
+                        IaCDiagnostic(
+                            IaCDiagnosticSeverity.ERROR,
+                            (
+                                "duplicate relationship identity: "
+                                f"{relationship.id}"
+                            ),
+                            document.name,
+                            self.adapter_id,
+                        )
+                    )
+                    continue
+                relationship_ids.add(relationship.id)
+                relationships.append(relationship)
+            evidence.extend(
+                item
+                for item in parsed.evidence
+                if not set(item.resource_ids) & document_duplicate_ids
+            )
+
+        retained_ids = {item.id for item in resources}
+        relationships = [
+            item
+            for item in relationships
+            if item.source_resource_id in retained_ids
+            and item.target_resource_id in retained_ids
+        ]
+        architecture_id = _stable_id(
+            "architecture",
+            self.adapter_id,
+            iac_input.content_digest,
+        )
+        return IaCParseResult(
+            Architecture(
+                architecture_id,
+                (
+                    Path(iac_input.documents[0].name).stem
+                    if len(iac_input.documents) == 1
+                    else "terraform"
+                ),
+                tuple(resources),
+                tuple(relationships),
+            ),
+            tuple(evidence),
+            tuple(diagnostics),
         )
 
 

@@ -22,14 +22,15 @@ from cloudguard.bedrock_review import (
 from cloudguard.domain import Architecture, Finding
 from cloudguard.evidence import EvidenceAggregator, EvidencePackage
 from cloudguard.facts import FactNormalizer, NormalizedFacts
+from cloudguard.iac import (
+    IaCAdapter,
+    IaCDiagnostic,
+    IaCDiagnosticSeverity,
+    IaCInput,
+)
 from cloudguard.reports import GeneratedReports, ReportGenerator
 from cloudguard.repository import IdempotencyConflict, ReviewRepository, StoredReview
 from cloudguard.rules import RuleEngine, RuleEngineConfig, RuleEvaluation
-from cloudguard.terraform import (
-    DiagnosticSeverity,
-    TerraformDiagnostic,
-    TerraformParser,
-)
 
 
 class PipelineState(StrEnum):
@@ -83,8 +84,7 @@ class ReviewPipelineInput:
     correlation_id: str
     idempotency_key: str
     request_hash: str
-    filename: str
-    content: str
+    iac_input: IaCInput
     rule_states: Mapping[str, bool]
     enable_aws_context: bool = False
     enable_bedrock: bool = False
@@ -160,8 +160,8 @@ class ReviewPipeline:
     def __init__(
         self,
         repository: ReviewPersistence | ReviewRepository,
+        iac_adapter: IaCAdapter,
         *,
-        parser: TerraformParser | None = None,
         fact_normalizer: FactNormalizer | None = None,
         evidence_aggregator: EvidenceAggregator | None = None,
         report_generator: ReportGenerator | None = None,
@@ -170,7 +170,7 @@ class ReviewPipeline:
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.repository = repository
-        self.parser = parser or TerraformParser()
+        self.iac_adapter = iac_adapter
         self.fact_normalizer = fact_normalizer or FactNormalizer()
         self.evidence_aggregator = evidence_aggregator or EvidenceAggregator()
         self.report_generator = report_generator or ReportGenerator()
@@ -187,7 +187,7 @@ class ReviewPipeline:
                 review_id=pipeline_input.review_id,
                 idempotency_key=pipeline_input.idempotency_key,
                 request_hash=pipeline_input.request_hash,
-                filename=pipeline_input.filename,
+                filename=pipeline_input.iac_input.display_name,
                 now=now,
             )
         except IdempotencyConflict:
@@ -219,9 +219,25 @@ class ReviewPipeline:
                 stages,
             )
 
-        parsed = self.parser.parse_text(
-            pipeline_input.content, filename=pipeline_input.filename
-        )
+        try:
+            parsed = self.iac_adapter.parse(pipeline_input.iac_input)
+        except Exception:  # noqa: BLE001 - adapter boundary becomes pipeline state
+            diagnostics.append(
+                self._error(
+                    PipelineState.PARSED,
+                    "iac_adapter_failed",
+                    "IaC adapter failed to parse the submitted input.",
+                    self.iac_adapter.adapter_id,
+                )
+            )
+            return self._fail(
+                pipeline_input,
+                stored,
+                diagnostics,
+                stages,
+                PipelineFailureKind.PARSER,
+                "IaC parsing failed",
+            )
         diagnostics.extend(self._parser_diagnostics(parsed.diagnostics))
         if parsed.has_errors:
             return self._fail(
@@ -230,7 +246,7 @@ class ReviewPipeline:
                 diagnostics,
                 stages,
                 PipelineFailureKind.PARSER,
-                "Terraform parsing failed",
+                "IaC parsing failed",
                 architecture=parsed.architecture,
             )
         stages.append(PipelineState.PARSED)
@@ -243,14 +259,14 @@ class ReviewPipeline:
 
         try:
             facts = self.fact_normalizer.normalize(
-                parsed.architecture, parsed.evidence, aws_context
+                parsed.architecture, parsed.declared_evidence, aws_context
             )
             stages.append(PipelineState.FACTS_RECONCILED)
             evaluation = RuleEngine(
                 RuleEngineConfig(pipeline_input.rule_states)
             ).evaluate(
                 parsed.architecture,
-                parsed.evidence,
+                parsed.declared_evidence,
                 normalized_facts=facts,
             )
             stages.append(PipelineState.RULES_EVALUATED)
@@ -276,7 +292,7 @@ class ReviewPipeline:
             evidence_package = self.evidence_aggregator.aggregate(
                 parsed.architecture,
                 evaluation.findings,
-                parsed.evidence,
+                parsed.declared_evidence,
                 aws_context,
                 review_id=pipeline_input.review_id,
                 correlation_id=pipeline_input.correlation_id,
@@ -587,17 +603,17 @@ class ReviewPipeline:
 
     @staticmethod
     def _parser_diagnostics(
-        values: tuple[TerraformDiagnostic, ...],
+        values: tuple[IaCDiagnostic, ...],
     ) -> tuple[PipelineDiagnostic, ...]:
         return tuple(
             PipelineDiagnostic(
                 PipelineState.PARSED,
                 (
                     PipelineDiagnosticSeverity.ERROR
-                    if item.severity is DiagnosticSeverity.ERROR
+                    if item.severity is IaCDiagnosticSeverity.ERROR
                     else PipelineDiagnosticSeverity.WARNING
                 ),
-                "terraform_parse_error",
+                f"{item.adapter_id}_parse_error",
                 item.message,
                 item.source_location,
             )

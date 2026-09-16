@@ -1,14 +1,13 @@
 import io
 import json
 import logging
-from pathlib import Path
 import tempfile
 import unittest
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from cloudguard.api import _JsonFormatter, create_app, logger
-
 
 VALID_TERRAFORM = '''
 resource "aws_db_instance" "primary" {
@@ -70,6 +69,42 @@ class LocalAPITests(unittest.TestCase):
         self.assertIn("executive_summary", report.json()["json_report"])
         self.assertIn("# CloudGuard Architecture Review", report.json()["markdown"])
         self.assertEqual(health.json(), {"status": "ok", "persistence": "ok"})
+
+    def test_multi_document_terraform_request(self) -> None:
+        response = self.client.post(
+            "/reviews",
+            json={
+                "format": "terraform",
+                "documents": [
+                    {
+                        "filename": "database.tf",
+                        "content": VALID_TERRAFORM,
+                    },
+                    {
+                        "filename": "storage.tf",
+                        "content": 'resource "aws_s3_bucket" "logs" {}',
+                    },
+                ],
+                "rule_states": {},
+            },
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()["status"], "completed")
+        self.assertEqual(response.json()["resource_count"], 2)
+
+    def test_unsupported_iac_format_is_rejected(self) -> None:
+        response = self.client.post(
+            "/reviews",
+            json={
+                "format": "cloudformation",
+                "filename": "main.tf",
+                "content": VALID_TERRAFORM,
+                "rule_states": {},
+            },
+        )
+
+        self.assertEqual(response.status_code, 422)
 
     def test_duplicate_submission_is_idempotent(self) -> None:
         headers = {"Idempotency-Key": "same-review"}
