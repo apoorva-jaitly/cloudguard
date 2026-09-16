@@ -287,7 +287,7 @@ def create_app(
         key = idempotency_key or f"sha256:{request_hash}"
         if not _IDEMPOTENCY_RE.fullmatch(key):
             raise HTTPException(422, "invalid Idempotency-Key")
-        review_id = f"review.{uuid.uuid4().hex}"
+        review_id = f"review.{request_hash[:32]}"
         try:
             result = pipeline.run(
                 ReviewPipelineInput(
@@ -390,10 +390,13 @@ def _iac_input(submission: ReviewSubmission) -> IaCInput:
 def _review_response(stored: StoredReview) -> ReviewResponse:
     return ReviewResponse(
         review_id=stored.review_id,
-        status=stored.status,
+        status=stored.status.value,
         filename=stored.filename,
         created_at=stored.created_at,
         updated_at=stored.updated_at,
+        started_at=stored.started_at,
+        completed_at=stored.completed_at,
+        attempt_count=stored.attempt_count,
         resource_count=stored.resource_count,
         finding_count=stored.finding_count,
         diagnostics=[

@@ -131,6 +131,16 @@ class LocalAPITests(unittest.TestCase):
         first = self.submit()
         second = self.submit()
         self.assertEqual(first.json()["review_id"], second.json()["review_id"])
+        self.assertEqual(first.json()["attempt_count"], 1)
+        self.assertEqual(second.json()["attempt_count"], 1)
+
+    def test_same_content_with_different_keys_uses_same_review(self) -> None:
+        first = self.submit(headers={"Idempotency-Key": "first-key"})
+        second = self.submit(headers={"Idempotency-Key": "second-key"})
+
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(first.json()["review_id"], second.json()["review_id"])
 
     def test_request_size_limit_is_enforced_before_validation(self) -> None:
         app = create_app(

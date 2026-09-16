@@ -85,6 +85,9 @@ class ReviewResponse(StrictSchema):
     filename: str
     created_at: datetime
     updated_at: datetime
+    started_at: datetime | None
+    completed_at: datetime | None
+    attempt_count: int = Field(ge=0)
     resource_count: int = Field(ge=0)
     finding_count: int = Field(ge=0)
     diagnostics: list[DiagnosticResponse]

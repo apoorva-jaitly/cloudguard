@@ -120,6 +120,9 @@ class FailingCompleteRepository:
     def complete(self, *args, **kwargs):
         raise RuntimeError("database unavailable")
 
+    def start_processing(self, *args, **kwargs):
+        return self.delegate.start_processing(*args, **kwargs)
+
     def fail(self, *args, **kwargs):
         return self.delegate.fail(*args, **kwargs)
 
@@ -201,7 +204,7 @@ class ReviewPipelineTests(unittest.TestCase):
         )
         result = self.pipeline(
             aws_context_provider=ContextProvider(RuntimeError("offline"))
-        ).run(self.pipeline_input(enable_aws_context=True))
+        ).run(self.pipeline_input(enable_aws_context=True, request_hash="b" * 64))
 
         self.assertEqual(result.state, PipelineState.PARTIAL)
         self.assertEqual(result.stored_review.status, "partial")
@@ -339,7 +342,8 @@ class ReviewPipelineTests(unittest.TestCase):
         ).run(self.pipeline_input())
 
         self.assertEqual(result.failure_kind, PipelineFailureKind.EVIDENCE)
-        self.assertEqual(result.state, PipelineState.FAILED)
+        self.assertEqual(result.state, PipelineState.PARTIAL)
+        self.assertEqual(result.stored_review.status, "partial")
         self.assertTrue(result.deterministic_findings)
 
     def test_report_generation_failure_is_explicit(self) -> None:
@@ -348,6 +352,8 @@ class ReviewPipelineTests(unittest.TestCase):
         ).run(self.pipeline_input())
 
         self.assertEqual(result.failure_kind, PipelineFailureKind.REPORT)
+        self.assertEqual(result.state, PipelineState.PARTIAL)
+        self.assertEqual(result.stored_review.status, "partial")
         self.assertIsNotNone(result.evidence_package)
         self.assertIsNone(result.report)
 
