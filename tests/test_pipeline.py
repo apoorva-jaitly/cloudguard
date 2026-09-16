@@ -16,6 +16,7 @@ from cloudguard.bedrock_review import (
     BedrockReviewStatus,
 )
 from cloudguard.evidence import EvidenceAggregator
+from cloudguard.iac import IaCDocument, IaCInput
 from cloudguard.pipeline import (
     PipelineFailureKind,
     PipelineState,
@@ -24,6 +25,7 @@ from cloudguard.pipeline import (
 )
 from cloudguard.reports import ReportGenerator
 from cloudguard.repository import ReviewRepository
+from cloudguard.terraform import TerraformAdapter
 
 NOW = datetime(2026, 9, 16, 12, 0, tzinfo=UTC)
 TERRAFORM = """
@@ -81,6 +83,13 @@ class InvalidAIProvider:
         )
 
 
+class FailingIaCAdapter:
+    adapter_id = "failing-test-adapter"
+
+    def parse(self, iac_input):
+        raise RuntimeError("adapter failed")
+
+
 class FailingEvidenceAggregator(EvidenceAggregator):
     def aggregate(self, *args, **kwargs):
         raise ValueError("evidence failed")
@@ -119,8 +128,7 @@ class ReviewPipelineTests(unittest.TestCase):
             "correlation_id": "correlation.test",
             "idempotency_key": "pipeline-test",
             "request_hash": "a" * 64,
-            "filename": "main.tf",
-            "content": TERRAFORM,
+            "iac_input": IaCInput((IaCDocument("main.tf", TERRAFORM),)),
             "rule_states": {},
             "enable_aws_context": False,
             "enable_bedrock": False,
@@ -131,6 +139,7 @@ class ReviewPipelineTests(unittest.TestCase):
     def pipeline(self, **kwargs) -> ReviewPipeline:
         return ReviewPipeline(
             self.repository,
+            TerraformAdapter(),
             clock=lambda: NOW,
             **kwargs,
         )
@@ -281,13 +290,36 @@ class ReviewPipelineTests(unittest.TestCase):
 
     def test_parser_failure_is_persisted(self) -> None:
         result = self.pipeline().run(
-            self.pipeline_input(content='resource "aws_s3_bucket" "broken" {')
+            self.pipeline_input(
+                iac_input=IaCInput(
+                    (
+                        IaCDocument(
+                            "main.tf",
+                            'resource "aws_s3_bucket" "broken" {',
+                        ),
+                    )
+                )
+            )
         )
 
         self.assertEqual(result.state, PipelineState.FAILED)
         self.assertEqual(result.failure_kind, PipelineFailureKind.PARSER)
         self.assertEqual(result.stored_review.status, "failed")
         self.assertIsNone(result.report)
+
+    def test_adapter_failure_is_a_parser_stage_failure(self) -> None:
+        result = ReviewPipeline(
+            self.repository,
+            FailingIaCAdapter(),
+            clock=lambda: NOW,
+        ).run(self.pipeline_input())
+
+        self.assertEqual(result.state, PipelineState.FAILED)
+        self.assertEqual(result.failure_kind, PipelineFailureKind.PARSER)
+        self.assertEqual(result.stored_review.status, "failed")
+        self.assertTrue(
+            any(item.code == "iac_adapter_failed" for item in result.diagnostics)
+        )
 
     def test_evidence_generation_failure_is_explicit(self) -> None:
         result = self.pipeline(
@@ -309,7 +341,11 @@ class ReviewPipelineTests(unittest.TestCase):
 
     def test_persistence_completion_failure_preserves_in_memory_result(self) -> None:
         repository = FailingCompleteRepository(self.repository)
-        result = ReviewPipeline(repository, clock=lambda: NOW).run(
+        result = ReviewPipeline(
+            repository,
+            TerraformAdapter(),
+            clock=lambda: NOW,
+        ).run(
             self.pipeline_input()
         )
 
@@ -355,6 +391,34 @@ class ReviewPipelineTests(unittest.TestCase):
         self.assertEqual(replay.review_id, first.review_id)
         self.assertEqual(replay.stored_review.review_id, first.review_id)
         self.assertEqual(replay.correlation_id, "replay-request")
+
+    def test_multiple_documents_follow_same_normalized_pipeline(self) -> None:
+        result = self.pipeline().run(
+            self.pipeline_input(
+                iac_input=IaCInput(
+                    (
+                        IaCDocument(
+                            "database.tf",
+                            TERRAFORM,
+                        ),
+                        IaCDocument(
+                            "storage.tf",
+                            'resource "aws_s3_bucket" "logs" {}',
+                        ),
+                    )
+                )
+            )
+        )
+
+        self.assertEqual(result.state, PipelineState.COMPLETED)
+        self.assertEqual(len(result.architecture.resources), 2)
+        self.assertEqual(
+            {item.resource_id for item in result.evidence_package.resources},
+            {
+                "terraform.aws_db_instance.primary",
+                "terraform.aws_s3_bucket.logs",
+            },
+        )
 
 
 if __name__ == "__main__":

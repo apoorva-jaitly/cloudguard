@@ -1,10 +1,9 @@
-from pathlib import Path
 import tempfile
 import unittest
+from pathlib import Path
 
 from cloudguard.domain import RelationshipType
 from cloudguard.terraform import DiagnosticSeverity, TerraformParser
-
 
 FIXTURES = Path(__file__).parent / "fixtures" / "terraform"
 
