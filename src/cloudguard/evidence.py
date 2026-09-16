@@ -5,14 +5,15 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Callable, Mapping
 
 from cloudguard.aws_context import AWSContextResult
 from cloudguard.domain import Architecture, Evidence, Finding, JsonValue
+from cloudguard.facts import FactNormalizer, NormalizedFacts
 
 _REDACTED = "[REDACTED]"
 _SENSITIVE_KEY_RE = re.compile(
@@ -32,6 +33,7 @@ _PEM_RE = re.compile(
     r"-----END [A-Z0-9 ]+PRIVATE KEY-----",
     re.DOTALL,
 )
+_MAX_INVENTORY_REFERENCES = 10
 
 
 class EvidenceKind(StrEnum):
@@ -89,6 +91,20 @@ class EvidenceResource:
     resource_type: str
     name: str
     source_location: str | None
+    attributes: JsonValue = MappingProxyType({})
+    declared_fact_ids: tuple[str, ...] = ()
+    observed_fact_ids: tuple[str, ...] = ()
+    evidence_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceRelationship:
+    relationship_id: str
+    source_resource_id: str
+    target_resource_id: str
+    relationship_type: str
+    evidence_ids: tuple[str, ...]
+    confidence: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,11 +132,19 @@ class EvidencePackage:
     omitted_evidence_count: int
     omitted_evidence_ids: tuple[str, ...]
     serialized_size_bytes: int
+    relationships: tuple[EvidenceRelationship, ...] = ()
+    omitted_resource_count: int = 0
+    omitted_resource_ids: tuple[str, ...] = ()
+    omitted_relationship_count: int = 0
+    review_id: str | None = None
+    correlation_id: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
             "package_id": self.package_id,
             "architecture_id": self.architecture_id,
+            "review_id": self.review_id,
+            "correlation_id": self.correlation_id,
             "generated_at": self.generated_at.isoformat(),
             "resources": [
                 {
@@ -128,8 +152,23 @@ class EvidencePackage:
                     "resource_type": item.resource_type,
                     "name": item.name,
                     "source_location": item.source_location,
+                    "attributes": _plain(item.attributes),
+                    "declared_fact_ids": list(item.declared_fact_ids),
+                    "observed_fact_ids": list(item.observed_fact_ids),
+                    "evidence_ids": list(item.evidence_ids),
                 }
                 for item in self.resources
+            ],
+            "relationships": [
+                {
+                    "relationship_id": item.relationship_id,
+                    "source_resource_id": item.source_resource_id,
+                    "target_resource_id": item.target_resource_id,
+                    "relationship_type": item.relationship_type,
+                    "evidence_ids": list(item.evidence_ids),
+                    "confidence": item.confidence,
+                }
+                for item in self.relationships
             ],
             "findings": [
                 {
@@ -164,6 +203,9 @@ class EvidencePackage:
             "omitted_evidence_count": self.omitted_evidence_count,
             "omitted_evidence_ids": list(self.omitted_evidence_ids),
             "serialized_size_bytes": self.serialized_size_bytes,
+            "omitted_resource_count": self.omitted_resource_count,
+            "omitted_resource_ids": list(self.omitted_resource_ids),
+            "omitted_relationship_count": self.omitted_relationship_count,
         }
 
     def to_json(self) -> str:
@@ -195,9 +237,17 @@ class EvidenceAggregator:
         findings: tuple[Finding, ...],
         parsed_evidence: tuple[Evidence, ...],
         aws_context: AWSContextResult | None = None,
+        *,
+        review_id: str | None = None,
+        correlation_id: str | None = None,
     ) -> EvidencePackage:
         self._validate_inputs(architecture, findings, parsed_evidence, aws_context)
+        self._validate_trace_id(review_id, "review_id")
+        self._validate_trace_id(correlation_id, "correlation_id")
         generated_at = self._now()
+        normalized_facts = FactNormalizer().normalize(
+            architecture, parsed_evidence, aws_context
+        )
         affected_ids = {
             resource_id
             for finding in findings
@@ -213,18 +263,9 @@ class EvidenceAggregator:
                 + ", ".join(unknown)
             )
 
-        resources = tuple(
-            EvidenceResource(
-                resource_id,
-                architecture_resources[resource_id].resource_type,
-                _redact_text(architecture_resources[resource_id].name),
-                (
-                    _redact_text(architecture_resources[resource_id].source_location)
-                    if architecture_resources[resource_id].source_location
-                    else None
-                ),
-            )
-            for resource_id in sorted(affected_ids)
+        inventory_candidates = tuple(
+            self._resource(resource, normalized_facts, parsed_evidence)
+            for resource in sorted(architecture.resources, key=lambda item: item.id)
         )
         finding_summaries = tuple(
             EvidenceFinding(
@@ -239,15 +280,15 @@ class EvidenceAggregator:
             )
             for finding in sorted(findings, key=lambda item: item.id)
         )
-        referenced_evidence_ids = {
+        finding_evidence_ids = {
             evidence_id for finding in findings for evidence_id in finding.evidence_ids
         }
 
         candidates: list[AggregatedEvidenceItem] = []
         for item in sorted(parsed_evidence, key=lambda value: value.id):
-            if item.id not in referenced_evidence_ids:
-                continue
-            for resource_id in sorted(set(item.resource_ids) & affected_ids):
+            for resource_id in sorted(
+                set(item.resource_ids) & set(architecture_resources)
+            ):
                 candidates.append(
                     self._item(
                         evidence_id=item.id,
@@ -276,7 +317,7 @@ class EvidenceAggregator:
                     content={"name": fact.name, "value": fact.value},
                 )
                 for fact in sorted(aws_context.facts, key=lambda value: value.id)
-                if fact.resource_id in affected_ids
+                if fact.resource_id in architecture_resources
             )
             aws_diagnostics = tuple(
                 MappingProxyType(
@@ -290,20 +331,80 @@ class EvidenceAggregator:
                 )
                 for diagnostic in aws_context.diagnostics
                 if diagnostic.resource_id is None
-                or diagnostic.resource_id in affected_ids
+                or diagnostic.resource_id in architecture_resources
             )
 
         package_id = _stable_id(
             "evidence-package",
             architecture.id,
-            *(finding.id for finding in findings),
-            generated_at.isoformat(),
+            _json_bytes(
+                {
+                    "resources": [
+                        {
+                            "id": item.resource_id,
+                            "type": item.resource_type,
+                            "attributes": item.attributes,
+                            "declared": item.declared_fact_ids,
+                            "observed": item.observed_fact_ids,
+                        }
+                        for item in inventory_candidates
+                    ],
+                    "relationships": [
+                        relationship.id
+                        for relationship in sorted(
+                            architecture.relationships, key=lambda item: item.id
+                        )
+                    ],
+                    "findings": [item.id for item in findings],
+                    "evidence": [item.id for item in parsed_evidence],
+                }
+            ).hex(),
         )
+        resources: list[EvidenceResource] = []
+        omitted_resources: list[str] = []
+        for resource in inventory_candidates:
+            trial = self._package(
+                package_id,
+                architecture.id,
+                generated_at,
+                tuple(resources + [resource]),
+                finding_summaries,
+                (),
+                aws_status,
+                aws_diagnostics,
+                0,
+                (),
+                review_id=review_id,
+                correlation_id=correlation_id,
+            )
+            if trial.serialized_size_bytes <= self.config.max_context_bytes:
+                resources.append(resource)
+            else:
+                omitted_resources.append(resource.resource_id)
+
+        included_resource_ids = {item.resource_id for item in resources}
+        relationships = tuple(
+            EvidenceRelationship(
+                relationship.id,
+                relationship.source_resource_id,
+                relationship.target_resource_id,
+                relationship.relationship_type.value,
+                relationship.evidence_ids,
+                relationship.confidence,
+            )
+            for relationship in sorted(
+                architecture.relationships, key=lambda item: item.id
+            )
+            if relationship.source_resource_id in included_resource_ids
+            and relationship.target_resource_id in included_resource_ids
+        )
+        omitted_relationship_count = len(architecture.relationships) - len(relationships)
         included: list[AggregatedEvidenceItem] = []
         omitted: list[str] = []
         for candidate in sorted(
             candidates,
             key=lambda item: (
+                0 if item.evidence_id in finding_evidence_ids else 1,
                 item.affected_resource_id,
                 item.kind.value,
                 item.evidence_id,
@@ -313,36 +414,102 @@ class EvidenceAggregator:
                 package_id,
                 architecture.id,
                 generated_at,
-                resources,
+                tuple(resources),
                 finding_summaries,
                 tuple(included + [candidate]),
                 aws_status,
                 aws_diagnostics,
                 len(omitted),
                 tuple(omitted[:20]),
+                relationships,
+                len(omitted_resources),
+                tuple(omitted_resources[:20]),
+                omitted_relationship_count,
+                review_id,
+                correlation_id,
             )
             if trial.serialized_size_bytes <= self.config.max_context_bytes:
                 included.append(candidate)
             else:
                 omitted.append(candidate.evidence_id)
 
-        package = self._package(
-            package_id,
-            architecture.id,
-            generated_at,
-            resources,
-            finding_summaries,
-            tuple(included),
-            aws_status,
-            aws_diagnostics,
-            len(omitted),
-            tuple(omitted[:20]),
-        )
+        displayed_omitted = omitted[:20]
+        displayed_omitted_resources = omitted_resources[:20]
+        while True:
+            package = self._package(
+                package_id,
+                architecture.id,
+                generated_at,
+                tuple(resources),
+                finding_summaries,
+                tuple(included),
+                aws_status,
+                aws_diagnostics,
+                len(omitted),
+                tuple(displayed_omitted),
+                relationships,
+                len(omitted_resources),
+                tuple(displayed_omitted_resources),
+                omitted_relationship_count,
+                review_id,
+                correlation_id,
+            )
+            if package.serialized_size_bytes <= self.config.max_context_bytes:
+                break
+            if displayed_omitted:
+                displayed_omitted.pop()
+                continue
+            if displayed_omitted_resources:
+                displayed_omitted_resources.pop()
+                continue
+            break
         if package.serialized_size_bytes > self.config.max_context_bytes:
             raise EvidencePackageTooLarge(
                 "required finding and provenance metadata exceeds max_context_bytes"
             )
         return package
+
+    def _resource(
+        self,
+        resource: object,
+        facts: NormalizedFacts,
+        parsed_evidence: tuple[Evidence, ...],
+    ) -> EvidenceResource:
+        from cloudguard.domain import AWSResource
+
+        if not isinstance(resource, AWSResource):
+            raise TypeError("resource must be an AWSResource")
+        attributes = {
+            key: value
+            for key, value in resource.properties.items()
+            if key != "_cloudguard"
+        }
+        return EvidenceResource(
+            resource.id,
+            self._bounded_text(resource.resource_type),
+            self._bounded_text(resource.name),
+            (
+                self._bounded_text(resource.source_location)
+                if resource.source_location
+                else None
+            ),
+            _redact(
+                attributes,
+                max_string_characters=self.config.max_string_characters,
+                max_collection_items=self.config.max_collection_items,
+            ),
+            tuple(
+                item.id for item in facts.declared if item.resource_id == resource.id
+            )[:_MAX_INVENTORY_REFERENCES],
+            tuple(
+                item.id for item in facts.observed if item.resource_id == resource.id
+            )[:_MAX_INVENTORY_REFERENCES],
+            tuple(
+                item.id
+                for item in parsed_evidence
+                if resource.id in item.resource_ids
+            )[:_MAX_INVENTORY_REFERENCES],
+        )
 
     def _item(
         self,
@@ -392,6 +559,12 @@ class EvidenceAggregator:
         aws_diagnostics: tuple[Mapping[str, JsonValue], ...],
         omitted_count: int,
         omitted_ids: tuple[str, ...],
+        relationships: tuple[EvidenceRelationship, ...] = (),
+        omitted_resource_count: int = 0,
+        omitted_resource_ids: tuple[str, ...] = (),
+        omitted_relationship_count: int = 0,
+        review_id: str | None = None,
+        correlation_id: str | None = None,
     ) -> EvidencePackage:
         provisional = EvidencePackage(
             package_id,
@@ -405,6 +578,12 @@ class EvidenceAggregator:
             omitted_count,
             omitted_ids,
             0,
+            relationships,
+            omitted_resource_count,
+            omitted_resource_ids,
+            omitted_relationship_count,
+            review_id,
+            correlation_id,
         )
         size = _json_size(provisional.to_dict())
         # Account for the decimal size field itself until it stabilizes.
@@ -421,6 +600,12 @@ class EvidenceAggregator:
                 omitted_count,
                 omitted_ids,
                 size,
+                relationships,
+                omitted_resource_count,
+                omitted_resource_ids,
+                omitted_relationship_count,
+                review_id,
+                correlation_id,
             )
             measured = _json_size(package.to_dict())
             if measured == size:
@@ -452,6 +637,13 @@ class EvidenceAggregator:
         if value.tzinfo is None:
             raise ValueError("clock must return a timezone-aware datetime")
         return value.astimezone(UTC)
+
+    @staticmethod
+    def _validate_trace_id(value: str | None, field_name: str) -> None:
+        if value is not None and (
+            not isinstance(value, str) or not value or len(value) > 128
+        ):
+            raise ValueError(f"{field_name} must be 1-128 characters or None")
 
 
 def _redact(
@@ -512,7 +704,7 @@ def _redact_text(value: str) -> str:
 def _plain(value: object) -> object:
     if isinstance(value, Mapping):
         return {str(key): _plain(item) for key, item in value.items()}
-    if isinstance(value, tuple):
+    if isinstance(value, (tuple, list)):
         return [_plain(item) for item in value]
     return value
 
@@ -533,4 +725,3 @@ def _json_size(value: object) -> int:
 def _stable_id(prefix: str, *parts: str) -> str:
     digest = hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()[:20]
     return f"{prefix}.{digest}"
-

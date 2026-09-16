@@ -103,17 +103,21 @@ class ReviewRepository:
         report_json: dict[str, Any],
         report_markdown: str,
         now: datetime,
+        status: str = "completed",
     ) -> StoredReview:
+        if status not in {"completed", "partial"}:
+            raise ValueError("status must be completed or partial")
         with self._lock, self._connect() as connection:
             connection.execute(
                 """
                 UPDATE reviews
-                SET status = 'completed', updated_at = ?, resource_count = ?,
+                SET status = ?, updated_at = ?, resource_count = ?,
                     finding_count = ?, diagnostics_json = ?, findings_json = ?,
                     report_json = ?, report_markdown = ?, error = NULL
                 WHERE review_id = ?
                 """,
                 (
+                    status,
                     _iso(now),
                     resource_count,
                     len(findings),

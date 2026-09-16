@@ -108,6 +108,8 @@ class ReportGenerator:
         report: dict[str, object] = {
             "report_id": report_id,
             "evidence_package_id": evidence_package.package_id,
+            "review_id": evidence_package.review_id,
+            "correlation_id": evidence_package.correlation_id,
             "generated_at": evidence_package.generated_at.isoformat(),
             "executive_summary": _executive_summary(
                 evidence_package, bedrock_review

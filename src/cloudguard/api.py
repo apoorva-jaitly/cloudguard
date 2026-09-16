@@ -15,13 +15,13 @@ import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from cloudguard.api_schemas import (
+    DiagnosticResponse,
     ErrorResponse,
     FindingResponse,
     FindingsResponse,
@@ -30,14 +30,16 @@ from cloudguard.api_schemas import (
     ReviewResponse,
     ReviewSubmission,
 )
-from cloudguard.evidence import EvidenceAggregator
-from cloudguard.reports import ReportGenerator
+from cloudguard.pipeline import (
+    PipelineFailureKind,
+    ReviewPipeline,
+    ReviewPipelineInput,
+)
 from cloudguard.repository import (
     IdempotencyConflict,
     ReviewRepository,
     StoredReview,
 )
-from cloudguard.rules import RuleEngine, RuleEngineConfig
 from cloudguard.terraform import TerraformParser
 
 DEFAULT_MAX_REQUEST_BYTES = 2_100_000
@@ -110,6 +112,7 @@ def create_app(
     parser = TerraformParser(
         max_input_bytes=min(max_request_bytes, 2_000_000)
     )
+    pipeline = ReviewPipeline(repository, parser=parser)
     app = FastAPI(
         title="CloudGuard Local API",
         version="0.1.0",
@@ -117,6 +120,7 @@ def create_app(
         redoc_url=None,
     )
     app.state.repository = repository
+    app.state.pipeline = pipeline
     app.state.max_request_bytes = max_request_bytes
     app.state.api_key = effective_api_key
     app.state.max_concurrent_reviews = max_concurrent_reviews
@@ -264,65 +268,52 @@ def create_app(
         key = idempotency_key or f"sha256:{request_hash}"
         if not _IDEMPOTENCY_RE.fullmatch(key):
             raise HTTPException(422, "invalid Idempotency-Key")
-        now = datetime.now(UTC)
         review_id = f"review.{uuid.uuid4().hex}"
         try:
-            stored, created = repository.create_or_get(
-                review_id=review_id,
-                idempotency_key=key,
-                request_hash=request_hash,
-                filename=submission.filename,
-                now=now,
+            result = pipeline.run(
+                ReviewPipelineInput(
+                    review_id=review_id,
+                    correlation_id=_correlation_id.get(),
+                    idempotency_key=key,
+                    request_hash=request_hash,
+                    filename=submission.filename,
+                    content=submission.content,
+                    rule_states=submission.rule_states,
+                )
             )
         except IdempotencyConflict as error:
             raise HTTPException(409, str(error)) from error
-        if not created:
+        if result.stored_review is None:
+            logger.error(
+                "",
+                extra={
+                    "event": "review_failed",
+                    "correlation_id": _correlation_id.get(),
+                    "review_id": review_id,
+                    "error_type": (
+                        result.failure_kind.value
+                        if result.failure_kind is not None
+                        else "unknown"
+                    ),
+                },
+            )
+            raise HTTPException(500, "review processing failed")
+        if not result.created:
             response.status_code = 200
-            return _review_response(stored)
-
-        try:
-            parsed = parser.parse_text(
-                submission.content,
-                filename=submission.filename,
+            return _review_response(result.stored_review)
+        response.status_code = 201
+        if result.failure_kind is PipelineFailureKind.CONFIGURATION:
+            logger.warning(
+                "",
+                extra={
+                    "event": "review_rejected",
+                    "correlation_id": _correlation_id.get(),
+                    "review_id": review_id,
+                    "error_type": result.failure_kind.value,
+                },
             )
-            diagnostics = [
-                {
-                    "severity": item.severity.value,
-                    "message": item.message,
-                    "source_location": item.source_location,
-                }
-                for item in parsed.diagnostics
-            ]
-            if parsed.has_errors:
-                failed = repository.fail(
-                    review_id,
-                    diagnostics=diagnostics,
-                    error="Terraform parsing failed",
-                    now=datetime.now(UTC),
-                )
-                response.status_code = 201
-                return _review_response(failed)
-
-            evaluation = RuleEngine(
-                RuleEngineConfig(submission.rule_states)
-            ).evaluate(parsed.architecture, parsed.evidence)
-            evidence_package = EvidenceAggregator().aggregate(
-                parsed.architecture,
-                evaluation.findings,
-                parsed.evidence,
-            )
-            reports = ReportGenerator().generate(evidence_package)
-            findings = [_finding_record(item) for item in evaluation.findings]
-            completed = repository.complete(
-                review_id,
-                resource_count=len(parsed.architecture.resources),
-                findings=findings,
-                diagnostics=diagnostics,
-                report_json=dict(reports.json_report),
-                report_markdown=reports.markdown,
-                now=datetime.now(UTC),
-            )
-            response.status_code = 201
+            raise HTTPException(422, "review configuration is invalid")
+        if result.state.value in {"completed", "partial"}:
             logger.info(
                 "",
                 extra={
@@ -331,41 +322,7 @@ def create_app(
                     "review_id": review_id,
                 },
             )
-            return _review_response(completed)
-        except ValueError as error:
-            failed = repository.fail(
-                review_id,
-                diagnostics=[],
-                error="Review configuration or processing was invalid",
-                now=datetime.now(UTC),
-            )
-            logger.warning(
-                "",
-                extra={
-                    "event": "review_rejected",
-                    "correlation_id": _correlation_id.get(),
-                    "review_id": review_id,
-                    "error_type": type(error).__name__,
-                },
-            )
-            raise HTTPException(422, "review configuration is invalid") from error
-        except Exception as error:
-            repository.fail(
-                review_id,
-                diagnostics=[],
-                error="Review processing failed",
-                now=datetime.now(UTC),
-            )
-            logger.exception(
-                "",
-                extra={
-                    "event": "review_failed",
-                    "correlation_id": _correlation_id.get(),
-                    "review_id": review_id,
-                    "error_type": type(error).__name__,
-                },
-            )
-            raise HTTPException(500, "review processing failed") from error
+        return _review_response(result.stored_review)
 
     @app.get("/reviews/{review_id}", response_model=ReviewResponse)
     def get_review(review_id: str) -> ReviewResponse:
@@ -399,22 +356,6 @@ def create_app(
     return app
 
 
-def _finding_record(finding: Any) -> dict[str, Any]:
-    return {
-        "finding_id": finding.id,
-        "pillar": finding.pillar.value,
-        "severity": finding.severity.value,
-        "title": finding.title,
-        "description": finding.description,
-        "evidence_ids": list(finding.evidence_ids),
-        "affected_resource_ids": list(finding.affected_resource_ids),
-        "confidence": finding.confidence,
-        "recommendation": finding.recommendation.description,
-        "estimated_effort": finding.estimated_effort.value,
-        "status": finding.status.value,
-    }
-
-
 def _review_response(stored: StoredReview) -> ReviewResponse:
     return ReviewResponse(
         review_id=stored.review_id,
@@ -424,7 +365,9 @@ def _review_response(stored: StoredReview) -> ReviewResponse:
         updated_at=stored.updated_at,
         resource_count=stored.resource_count,
         finding_count=stored.finding_count,
-        diagnostics=stored.diagnostics,
+        diagnostics=[
+            DiagnosticResponse.model_validate(item) for item in stored.diagnostics
+        ],
     )
 
 
