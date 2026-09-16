@@ -9,13 +9,14 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Callable, Mapping
 
+from cloudguard.aws_context import AWSContextResult
 from cloudguard.domain import (
-    AWSResource,
     Architecture,
+    AWSResource,
     Effort,
     Evidence,
     Finding,
@@ -25,6 +26,7 @@ from cloudguard.domain import (
     Recommendation,
     Severity,
 )
+from cloudguard.facts import FactNormalizer, NormalizedFacts
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +61,7 @@ class RuleEvaluation:
     findings: tuple[Finding, ...]
     evaluated_rule_ids: tuple[str, ...]
     disabled_rule_ids: tuple[str, ...]
+    normalized_facts: NormalizedFacts
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,13 +74,14 @@ class _Candidate:
 @dataclass(frozen=True, slots=True)
 class _Rule:
     definition: RuleDefinition
-    evaluate: Callable[["_Context"], tuple[_Candidate, ...]]
+    evaluate: Callable[[_Context], tuple[_Candidate, ...]]
 
 
 @dataclass(frozen=True, slots=True)
 class _Context:
     architecture: Architecture
     evidence_by_resource: Mapping[str, tuple[str, ...]]
+    normalized_facts: NormalizedFacts
 
     def resources_of_type(self, *resource_types: str) -> tuple[AWSResource, ...]:
         accepted = set(resource_types)
@@ -86,6 +90,15 @@ class _Context:
             for resource in self.architecture.resources
             if resource.resource_type in accepted
         )
+
+    def declared_property(
+        self, resource: AWSResource, *names: str
+    ) -> JsonValue | None:
+        for name in names:
+            fact = self.normalized_facts.declared_fact(resource.id, name)
+            if fact is not None:
+                return fact.value
+        return None
 
 
 class RuleEngine:
@@ -103,7 +116,12 @@ class RuleEngine:
         return tuple(rule.definition for rule in _RULES)
 
     def evaluate(
-        self, architecture: Architecture, evidence: tuple[Evidence, ...]
+        self,
+        architecture: Architecture,
+        evidence: tuple[Evidence, ...],
+        *,
+        aws_context: AWSContextResult | None = None,
+        normalized_facts: NormalizedFacts | None = None,
     ) -> RuleEvaluation:
         if not isinstance(architecture, Architecture):
             raise TypeError("architecture must be an Architecture")
@@ -111,6 +129,13 @@ class RuleEngine:
             not isinstance(item, Evidence) for item in evidence
         ):
             raise TypeError("evidence must be a tuple of Evidence objects")
+        if aws_context is not None and normalized_facts is not None:
+            raise ValueError("provide aws_context or normalized_facts, not both")
+        facts = normalized_facts or FactNormalizer().normalize(
+            architecture, evidence, aws_context
+        )
+        if not isinstance(facts, NormalizedFacts):
+            raise TypeError("normalized_facts must be NormalizedFacts")
 
         resource_ids = {resource.id for resource in architecture.resources}
         evidence_by_resource: dict[str, list[str]] = {
@@ -128,6 +153,7 @@ class RuleEngine:
                     for resource_id, ids in evidence_by_resource.items()
                 }
             ),
+            facts,
         )
 
         findings: list[Finding] = []
@@ -182,6 +208,7 @@ class RuleEngine:
             findings=tuple(findings),
             evaluated_rule_ids=tuple(evaluated),
             disabled_rule_ids=tuple(disabled),
+            normalized_facts=facts,
         )
 
 
@@ -276,8 +303,10 @@ def _single_az_stateful(context: _Context) -> tuple[_Candidate, ...]:
     for resource in context.architecture.resources:
         if resource.resource_type not in _STATEFUL_TYPES or not _is_critical(resource):
             continue
-        availability_zone = _property(resource, "availability_zone", "availabilityZone")
-        subnet_ids = _property(resource, "subnet_ids", "subnetIds")
+        availability_zone = context.declared_property(
+            resource, "availability_zone", "availabilityZone"
+        )
+        subnet_ids = context.declared_property(resource, "subnet_ids", "subnetIds")
         explicitly_single_az = isinstance(availability_zone, str) or (
             isinstance(subnet_ids, tuple) and len(subnet_ids) == 1
         )
@@ -296,7 +325,7 @@ def _backup_configuration(context: _Context) -> tuple[_Candidate, ...]:
     for resource in context.architecture.resources:
         if resource.resource_type not in _STATEFUL_TYPES:
             continue
-        configured = _backup_state(resource)
+        configured = _backup_state(context, resource)
         if configured is not True:
             state = "disabled" if configured is False else "not established"
             candidates.append(
@@ -314,7 +343,7 @@ def _database_multi_az(context: _Context) -> tuple[_Candidate, ...]:
     for resource in context.architecture.resources:
         if resource.resource_type not in _DATABASE_TYPES:
             continue
-        state = _multi_az_state(resource)
+        state = _multi_az_state(context, resource)
         if state is not True:
             wording = "disabled" if state is False else "not established"
             candidates.append(
@@ -374,7 +403,12 @@ def _public_rds(context: _Context) -> tuple[_Candidate, ...]:
             "The database sets publicly_accessible to true.",
         )
         for resource in context.resources_of_type("aws_db_instance")
-        if _literal_bool(_property(resource, "publicly_accessible")) is True
+        if (
+            _literal_bool(
+                context.declared_property(resource, "publicly_accessible")
+            )
+            is True
+        )
     )
 
 
@@ -389,7 +423,7 @@ def _unrestricted_ingress(context: _Context) -> tuple[_Candidate, ...]:
         if not (_OPEN_IPV4_RE.search(text) or _OPEN_IPV6_RE.search(text)):
             continue
         if resource.resource_type == "aws_security_group_rule":
-            rule_type = _property(resource, "type")
+            rule_type = context.declared_property(resource, "type")
             if isinstance(rule_type, str) and rule_type != "ingress":
                 continue
         candidates.append(
@@ -409,7 +443,7 @@ def _wildcard_iam(context: _Context) -> tuple[_Candidate, ...]:
         "aws_iam_user_policy",
         "aws_iam_group_policy",
     ):
-        policy_text = _value_text(_property(resource, "policy"))
+        policy_text = _value_text(context.declared_property(resource, "policy"))
         if policy_text and (
             _WILDCARD_ACTION_RE.search(policy_text)
             or _WILDCARD_RESOURCE_RE.search(policy_text)
@@ -429,7 +463,7 @@ def _encryption(context: _Context) -> tuple[_Candidate, ...]:
         property_names = _ENCRYPTABLE_PROPERTIES.get(resource.resource_type)
         if property_names is None:
             continue
-        value = _property(resource, *property_names)
+        value = context.declared_property(resource, *property_names)
         state = _literal_bool(value)
         if state is not True:
             wording = "explicitly disabled" if state is False else "not established"
@@ -513,7 +547,9 @@ def _deployment_rollback(context: _Context) -> tuple[_Candidate, ...]:
 def _log_retention(context: _Context) -> tuple[_Candidate, ...]:
     candidates = []
     for resource in context.resources_of_type("aws_cloudwatch_log_group"):
-        retention = _literal_int(_property(resource, "retention_in_days"))
+        retention = _literal_int(
+            context.declared_property(resource, "retention_in_days")
+        )
         if retention is None or retention <= 0:
             candidates.append(
                 _Candidate(
@@ -538,7 +574,9 @@ def _expensive_network(context: _Context) -> tuple[_Candidate, ...]:
 def _always_on_compute(context: _Context) -> tuple[_Candidate, ...]:
     candidates = []
     for resource in context.resources_of_type("aws_instance"):
-        schedule = _property(resource, "schedule", "instance_schedule")
+        schedule = context.declared_property(
+            resource, "schedule", "instance_schedule"
+        )
         if schedule is None:
             candidates.append(
                 _Candidate(
@@ -548,13 +586,6 @@ def _always_on_compute(context: _Context) -> tuple[_Candidate, ...]:
                 )
             )
     return tuple(candidates)
-
-
-def _property(resource: AWSResource, *names: str) -> JsonValue | None:
-    for name in names:
-        if name in resource.properties:
-            return resource.properties[name]
-    return None
 
 
 def _is_critical(resource: AWSResource) -> bool:
@@ -574,19 +605,21 @@ def _is_critical(resource: AWSResource) -> bool:
     }
 
 
-def _backup_state(resource: AWSResource) -> bool | None:
+def _backup_state(context: _Context, resource: AWSResource) -> bool | None:
     if resource.resource_type in {"aws_db_instance", "aws_rds_cluster"}:
-        retention = _literal_int(_property(resource, "backup_retention_period"))
+        retention = _literal_int(
+            context.declared_property(resource, "backup_retention_period")
+        )
         return None if retention is None else retention > 0
     if resource.resource_type == "aws_dynamodb_table":
-        value = _property(
+        value = context.declared_property(
             resource,
             "point_in_time_recovery_enabled",
             "point_in_time_recovery",
         )
         return _literal_bool(value)
     return _literal_bool(
-        _property(
+        context.declared_property(
             resource,
             "backup_enabled",
             "automated_snapshot_retention_period",
@@ -595,25 +628,31 @@ def _backup_state(resource: AWSResource) -> bool | None:
     )
 
 
-def _multi_az_state(resource: AWSResource) -> bool | None:
+def _multi_az_state(context: _Context, resource: AWSResource) -> bool | None:
     if resource.resource_type == "aws_db_instance":
-        return _literal_bool(_property(resource, "multi_az"))
+        return _literal_bool(context.declared_property(resource, "multi_az"))
     if resource.resource_type == "aws_rds_cluster":
-        zones = _property(resource, "availability_zones")
+        zones = context.declared_property(resource, "availability_zones")
         return len(zones) >= 2 if isinstance(zones, tuple) else None
     if resource.resource_type == "aws_elasticache_replication_group":
         return _literal_bool(
-            _property(resource, "automatic_failover_enabled", "multi_az_enabled")
+            context.declared_property(
+                resource,
+                "automatic_failover_enabled",
+                "multi_az_enabled",
+            )
         )
     if resource.resource_type == "aws_elasticache_cluster":
         return False
     if resource.resource_type == "aws_opensearch_domain":
         zone_block = _named_block(resource, "zone_awareness_config")
         count = _literal_int(zone_block.get("availability_zone_count")) if zone_block else None
-        enabled = _literal_bool(_property(resource, "zone_awareness_enabled"))
+        enabled = _literal_bool(
+            context.declared_property(resource, "zone_awareness_enabled")
+        )
         return enabled is True and count is not None and count >= 2
     if resource.resource_type == "aws_redshift_cluster":
-        return _literal_bool(_property(resource, "multi_az"))
+        return _literal_bool(context.declared_property(resource, "multi_az"))
     return None
 
 
