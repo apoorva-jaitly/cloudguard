@@ -29,12 +29,20 @@ from cloudguard.iac import (
     IaCInput,
 )
 from cloudguard.reports import GeneratedReports, ReportGenerator
-from cloudguard.repository import IdempotencyConflict, ReviewRepository, StoredReview
+from cloudguard.repository import (
+    IdempotencyConflict,
+    InvalidReviewTransition,
+    RetryLimitExceeded,
+    ReviewRepository,
+    ReviewState,
+    StoredReview,
+)
 from cloudguard.rules import RuleEngine, RuleEngineConfig, RuleEvaluation
 
 
 class PipelineState(StrEnum):
     RECEIVED = "received"
+    PROCESSING = "processing"
     PARSED = "parsed"
     CONTEXT_COLLECTED = "context_collected"
     FACTS_RECONCILED = "facts_reconciled"
@@ -121,6 +129,8 @@ class AIReviewProvider(Protocol):
 
 
 class ReviewPersistence(Protocol):
+    def get(self, review_id: str) -> StoredReview: ...
+
     def create_or_get(
         self,
         *,
@@ -131,6 +141,14 @@ class ReviewPersistence(Protocol):
         now: datetime,
     ) -> tuple[StoredReview, bool]: ...
 
+    def start_processing(
+        self,
+        review_id: str,
+        *,
+        now: datetime,
+        max_attempts: int,
+    ) -> StoredReview: ...
+
     def complete(
         self,
         review_id: str,
@@ -138,10 +156,11 @@ class ReviewPersistence(Protocol):
         resource_count: int,
         findings: list[dict[str, object]],
         diagnostics: list[dict[str, str]],
-        report_json: dict[str, object],
-        report_markdown: str,
+        report_json: dict[str, object] | None,
+        report_markdown: str | None,
         now: datetime,
-        status: str = "completed",
+        status: ReviewState = ReviewState.COMPLETED,
+        error: str | None = None,
     ) -> StoredReview: ...
 
     def fail(
@@ -168,7 +187,10 @@ class ReviewPipeline:
         aws_context_provider: AWSContextProvider | None = None,
         bedrock_provider: AIReviewProvider | None = None,
         clock: Callable[[], datetime] | None = None,
+        max_attempts: int = 3,
     ) -> None:
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be positive")
         self.repository = repository
         self.iac_adapter = iac_adapter
         self.fact_normalizer = fact_normalizer or FactNormalizer()
@@ -177,6 +199,7 @@ class ReviewPipeline:
         self.aws_context_provider = aws_context_provider
         self.bedrock_provider = bedrock_provider
         self._clock = clock or (lambda: datetime.now(UTC))
+        self.max_attempts = max_attempts
 
     def run(self, pipeline_input: ReviewPipelineInput) -> ReviewPipelineResult:
         diagnostics: list[PipelineDiagnostic] = []
@@ -209,12 +232,39 @@ class ReviewPipeline:
                 stages,
                 failure_kind=PipelineFailureKind.PERSISTENCE,
             )
-        if not created:
+        if stored.status.terminal or stored.status is ReviewState.PROCESSING:
             return self._result(
                 pipeline_input,
                 self._stored_state(stored),
                 False,
                 stored,
+                diagnostics,
+                stages,
+            )
+        try:
+            stored = self.repository.start_processing(
+                stored.review_id,
+                now=self._now(),
+                max_attempts=self.max_attempts,
+            )
+        except RetryLimitExceeded:
+            exhausted = self.repository.get(stored.review_id)
+            return self._result(
+                pipeline_input,
+                PipelineState.FAILED,
+                False,
+                exhausted,
+                diagnostics,
+                stages,
+                failure_kind=PipelineFailureKind.INTERNAL,
+            )
+        except InvalidReviewTransition:
+            latest = self.repository.get(stored.review_id)
+            return self._result(
+                pipeline_input,
+                self._stored_state(latest),
+                False,
+                latest,
                 diagnostics,
                 stages,
             )
@@ -233,6 +283,7 @@ class ReviewPipeline:
             return self._fail(
                 pipeline_input,
                 stored,
+                created,
                 diagnostics,
                 stages,
                 PipelineFailureKind.PARSER,
@@ -243,6 +294,7 @@ class ReviewPipeline:
             return self._fail(
                 pipeline_input,
                 stored,
+                created,
                 diagnostics,
                 stages,
                 PipelineFailureKind.PARSER,
@@ -281,6 +333,7 @@ class ReviewPipeline:
             return self._fail(
                 pipeline_input,
                 stored,
+                created,
                 diagnostics,
                 stages,
                 PipelineFailureKind.CONFIGURATION,
@@ -306,9 +359,10 @@ class ReviewPipeline:
                     "Bounded evidence generation failed.",
                 )
             )
-            return self._fail(
+            return self._partial(
                 pipeline_input,
                 stored,
+                created,
                 diagnostics,
                 stages,
                 PipelineFailureKind.EVIDENCE,
@@ -338,9 +392,10 @@ class ReviewPipeline:
                     "Review report generation failed.",
                 )
             )
-            return self._fail(
+            return self._partial(
                 pipeline_input,
                 stored,
+                created,
                 diagnostics,
                 stages,
                 PipelineFailureKind.REPORT,
@@ -367,9 +422,9 @@ class ReviewPipeline:
                 report_markdown=report.markdown,
                 now=self._now(),
                 status=(
-                    PipelineState.PARTIAL.value
+                    ReviewState.PARTIAL
                     if partial
-                    else PipelineState.COMPLETED.value
+                    else ReviewState.COMPLETED
                 ),
             )
         except Exception:  # noqa: BLE001 - persistence boundary becomes pipeline state
@@ -383,7 +438,7 @@ class ReviewPipeline:
             return self._result(
                 pipeline_input,
                 PipelineState.FAILED,
-                True,
+                created,
                 None,
                 diagnostics,
                 stages,
@@ -401,7 +456,7 @@ class ReviewPipeline:
         return self._result(
             pipeline_input,
             final_state,
-            True,
+            created,
             completed,
             diagnostics,
             stages,
@@ -519,6 +574,7 @@ class ReviewPipeline:
         self,
         pipeline_input: ReviewPipelineInput,
         stored: StoredReview,
+        created: bool,
         diagnostics: list[PipelineDiagnostic],
         stages: list[PipelineState],
         failure_kind: PipelineFailureKind,
@@ -552,8 +608,77 @@ class ReviewPipeline:
         return self._result(
             pipeline_input,
             PipelineState.FAILED,
-            True,
+            created,
             failed,
+            diagnostics,
+            stages,
+            architecture=architecture,
+            facts=facts,
+            evaluation=evaluation,
+            aws_context=aws_context,
+            ai_interpretation=ai_interpretation,
+            evidence_package=evidence_package,
+            failure_kind=failure_kind,
+        )
+
+    def _partial(
+        self,
+        pipeline_input: ReviewPipelineInput,
+        stored: StoredReview,
+        created: bool,
+        diagnostics: list[PipelineDiagnostic],
+        stages: list[PipelineState],
+        failure_kind: PipelineFailureKind,
+        error: str,
+        *,
+        architecture: Architecture,
+        facts: NormalizedFacts,
+        evaluation: RuleEvaluation,
+        aws_context: AWSContextResult | None = None,
+        ai_interpretation: BedrockReview | None = None,
+        evidence_package: EvidencePackage | None = None,
+    ) -> ReviewPipelineResult:
+        try:
+            partial = self.repository.complete(
+                stored.review_id,
+                resource_count=len(architecture.resources),
+                findings=[_finding_record(item) for item in evaluation.findings],
+                diagnostics=[item.to_record() for item in diagnostics],
+                report_json=None,
+                report_markdown=None,
+                now=self._now(),
+                status=ReviewState.PARTIAL,
+                error=error,
+            )
+        except Exception:  # noqa: BLE001 - persistence boundary becomes pipeline state
+            diagnostics.append(
+                self._error(
+                    PipelineState.PARTIAL,
+                    "persistence_partial_failed",
+                    "Partial review results could not be persisted.",
+                )
+            )
+            return self._result(
+                pipeline_input,
+                PipelineState.FAILED,
+                created,
+                None,
+                diagnostics,
+                stages,
+                architecture=architecture,
+                facts=facts,
+                evaluation=evaluation,
+                aws_context=aws_context,
+                ai_interpretation=ai_interpretation,
+                evidence_package=evidence_package,
+                failure_kind=PipelineFailureKind.PERSISTENCE,
+            )
+        stages.append(PipelineState.PARTIAL)
+        return self._result(
+            pipeline_input,
+            PipelineState.PARTIAL,
+            created,
+            partial,
             diagnostics,
             stages,
             architecture=architecture,
@@ -622,12 +747,14 @@ class ReviewPipeline:
 
     @staticmethod
     def _stored_state(stored: StoredReview) -> PipelineState:
-        if stored.status == "completed":
+        if stored.status is ReviewState.COMPLETED:
             return PipelineState.COMPLETED
-        if stored.status == "partial":
+        if stored.status is ReviewState.PARTIAL:
             return PipelineState.PARTIAL
-        if stored.status == "failed":
+        if stored.status is ReviewState.FAILED:
             return PipelineState.FAILED
+        if stored.status is ReviewState.PROCESSING:
+            return PipelineState.PROCESSING
         return PipelineState.RECEIVED
 
     @staticmethod
