@@ -5,9 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Mapping
+from typing import cast
 
 from cloudguard.bedrock_review import BedrockReview, ReviewPriority
 from cloudguard.evidence import EvidencePackage
@@ -74,9 +75,14 @@ class ReportGenerator:
 
         evidence_records = _evidence_records(evidence_package)
         findings = _finding_records(evidence_package)
-        known_evidence_ids = {item["evidence_id"] for item in evidence_records}
+        known_evidence_ids = {
+            str(item["evidence_id"]) for item in evidence_records
+        }
         for finding in findings:
-            missing = set(finding["evidence_ids"]) - known_evidence_ids
+            missing = (
+                set(cast(list[str], finding["evidence_ids"]))
+                - known_evidence_ids
+            )
             if missing:
                 raise ValueError(
                     f"finding {finding['finding_id']} has unreportable evidence IDs"
@@ -98,7 +104,7 @@ class ReportGenerator:
         recommendations = _recommendations(evidence_package, bedrock_review)
         roadmap = _roadmap(evidence_package, bedrock_review)
         assumptions = _assumptions(evidence_package)
-        open_questions = _open_questions(evidence_package, bedrock_review)
+        open_questions = _open_questions(evidence_package)
 
         report_id = _stable_id(
             "report",
@@ -137,7 +143,7 @@ class ReportGenerator:
             "assumptions": assumptions,
             "open_questions": open_questions,
         }
-        report = _redact(report)
+        report = cast(dict[str, object], _redact(report))
         missing_sections = set(_REQUIRED_SECTIONS) - set(report)
         if missing_sections:
             raise RuntimeError(
@@ -183,7 +189,7 @@ def _finding_records(package: EvidencePackage) -> list[dict[str, object]]:
 
 
 def _evidence_records(package: EvidencePackage) -> list[dict[str, object]]:
-    records = [
+    records: list[dict[str, object]] = [
         {
             "evidence_id": item.evidence_id,
             "source": item.source,
@@ -233,18 +239,12 @@ def _executive_summary(
     for finding in package.findings:
         severity_counts[finding.severity] = severity_counts.get(finding.severity, 0) + 1
     summary = (
-        review.architecture_summary
-        if review
-        else (
-            f"CloudGuard evaluated {len(package.resources)} affected resources "
-            f"and retained {len(package.findings)} deterministic findings."
-        )
+        f"CloudGuard evaluated {len(package.resources)} architecture resources "
+        f"and retained {len(package.findings)} deterministic findings."
     )
     return {
         "summary": summary,
-        "evidence_ids": (
-            list(review.architecture_summary_evidence_ids) if review else []
-        ),
+        "evidence_ids": [],
         "finding_count": len(package.findings),
         "severity_counts": severity_counts,
         "evidence_item_count": len(package.evidence),
@@ -266,62 +266,42 @@ def _architecture_overview(
             }
             for resource in package.resources
         ],
-        "facts": (
-            [
-                {
-                    "statement": fact.statement,
-                    "evidence_excerpt": fact.evidence_excerpt,
-                    "evidence_ids": list(fact.evidence_ids),
-                    "resource_ids": list(fact.resource_ids),
-                }
-                for fact in review.facts
-            ]
-            if review
-            else []
-        ),
-        "architectural_implications": (
-            [
-                {
-                    "title": item.title,
-                    "interpretation": item.interpretation,
-                    "evidence_ids": list(item.evidence_ids),
-                    "resource_ids": list(item.resource_ids),
-                    "confidence": item.confidence,
-                    "uncertainty": item.uncertainty,
-                }
-                for item in review.architectural_implications
-            ]
-            if review
-            else []
-        ),
+        "facts": [],
+        "architectural_implications": [],
     }
 
 
 def _recommendations(
     package: EvidencePackage, review: BedrockReview | None
 ) -> list[dict[str, object]]:
-    if review and review.remediations:
-        return [
-            {
-                "title": item.title,
-                "action": item.action,
-                "finding_ids": list(item.finding_ids),
-                "evidence_ids": list(item.evidence_ids),
-                "tradeoffs": item.tradeoffs,
-                "verification": item.verification,
-                "source": "bedrock_review",
-            }
-            for item in review.remediations
-        ]
+    reviewed = (
+        {item.finding_id: item for item in review.prioritized_findings}
+        if review
+        else {}
+    )
     return [
         {
             "title": f"Address {finding.title.lower()}",
-            "action": finding.recommendation,
+            "action": (
+                reviewed[finding.finding_id].recommendation
+                if finding.finding_id in reviewed
+                and reviewed[finding.finding_id].recommendation is not None
+                else finding.recommendation
+            ),
             "finding_ids": [finding.finding_id],
-            "evidence_ids": list(finding.evidence_ids),
+            "evidence_ids": list(
+                reviewed[finding.finding_id].evidence_ids
+                if finding.finding_id in reviewed
+                else finding.evidence_ids
+            ),
             "tradeoffs": "Requires implementation planning and validation.",
             "verification": "Re-run CloudGuard and confirm the finding is resolved.",
-            "source": "deterministic_finding",
+            "source": (
+                "bedrock_advisory"
+                if finding.finding_id in reviewed
+                and reviewed[finding.finding_id].recommendation is not None
+                else "deterministic_finding"
+            ),
         }
         for finding in package.findings
     ]
@@ -342,7 +322,7 @@ def _roadmap(
         "low": ReviewPriority.P3,
         "informational": ReviewPriority.P3,
     }
-    items = []
+    items: list[dict[str, object]] = []
     for finding in package.findings:
         reviewed = priorities.get(finding.finding_id)
         priority = (
@@ -380,28 +360,10 @@ def _pillar_considerations(
     findings_by_pillar: Mapping[str, list[dict[str, object]]],
     review: BedrockReview | None,
 ) -> dict[str, object]:
-    implications = []
-    if review:
-        related_evidence = {
-            evidence_id
-            for finding in findings_by_pillar.get(pillar, [])
-            for evidence_id in finding["evidence_ids"]
-        }
-        implications = [
-            {
-                "title": item.title,
-                "interpretation": item.interpretation,
-                "evidence_ids": list(item.evidence_ids),
-                "confidence": item.confidence,
-                "uncertainty": item.uncertainty,
-            }
-            for item in review.architectural_implications
-            if set(item.evidence_ids) & related_evidence
-        ]
     return {
         "finding_count": len(findings_by_pillar.get(pillar, [])),
         "findings": findings_by_pillar.get(pillar, []),
-        "interpretations": implications,
+        "interpretations": [],
     }
 
 
@@ -424,20 +386,8 @@ def _assumptions(package: EvidencePackage) -> list[str]:
     return assumptions
 
 
-def _open_questions(
-    package: EvidencePackage, review: BedrockReview | None
-) -> list[dict[str, object]]:
-    questions = []
-    if review:
-        questions.extend(
-            {
-                "question": item.description,
-                "missing_information": list(item.missing_information),
-                "resource_ids": list(item.related_resource_ids),
-                "evidence_ids": list(item.related_evidence_ids),
-            }
-            for item in review.uncertainties
-        )
+def _open_questions(package: EvidencePackage) -> list[dict[str, object]]:
+    questions: list[dict[str, object]] = []
     questions.extend(
         {
             "question": diagnostic["message"],
@@ -477,7 +427,7 @@ def _render_markdown(report: Mapping[str, object]) -> str:
             f"at {_md(location)}"
         )
     lines.extend(["", "## Findings by pillar", ""])
-    for pillar, findings in report["findings_by_pillar"].items():  # type: ignore[union-attr]
+    for pillar, findings in report["findings_by_pillar"].items():  # type: ignore[attr-defined]
         lines.extend([f"### {_title(pillar)}", ""])
         if not findings:
             lines.extend(["No findings.", ""])
@@ -488,7 +438,7 @@ def _render_markdown(report: Mapping[str, object]) -> str:
     lines.extend(["## Critical and high risks", ""])
     critical = report["critical_high_risks"]
     if critical:
-        for finding in critical:  # type: ignore[union-attr]
+        for finding in critical:  # type: ignore[attr-defined]
             lines.append(
                 f"- **{finding['severity'].upper()}** "
                 f"`{finding['finding_id']}` — {_md(finding['title'])}"
@@ -497,7 +447,7 @@ def _render_markdown(report: Mapping[str, object]) -> str:
         lines.append("No critical or high findings are present in the package.")
 
     lines.extend(["", "## Recommendations", ""])
-    for item in report["recommendations"]:  # type: ignore[union-attr]
+    for item in report["recommendations"]:  # type: ignore[attr-defined]
         lines.extend(
             [
                 f"### {_md(item['title'])}",
@@ -531,14 +481,16 @@ def _render_markdown(report: Mapping[str, object]) -> str:
         for item in section["interpretations"]:  # type: ignore[index]
             lines.extend(
                 [
-                    f"- **{_md(item['title'])}:** {_md(item['interpretation'])} "
-                    f"(evidence: {_evidence_links(item['evidence_ids'])})"
+                    (
+                        f"- **{_md(item['title'])}:** {_md(item['interpretation'])} "
+                        f"(evidence: {_evidence_links(item['evidence_ids'])})"
+                    )
                 ]
             )
         lines.append("")
 
     lines.extend(["## Prioritized roadmap", ""])
-    for item in report["prioritized_roadmap"]:  # type: ignore[union-attr]
+    for item in report["prioritized_roadmap"]:  # type: ignore[attr-defined]
         lines.extend(
             [
                 f"### {item['priority']} — {_md(item['title'])}",
@@ -555,19 +507,19 @@ def _render_markdown(report: Mapping[str, object]) -> str:
         )
 
     lines.extend(["## Assumptions", ""])
-    for assumption in report["assumptions"]:  # type: ignore[union-attr]
+    for assumption in report["assumptions"]:  # type: ignore[attr-defined]
         lines.append(f"- {_md(assumption)}")
 
     lines.extend(["", "## Open questions", ""])
     questions = report["open_questions"]
     if questions:
-        for question in questions:  # type: ignore[union-attr]
+        for question in questions:  # type: ignore[attr-defined]
             lines.append(f"- {_md(question['question'])}")
     else:
         lines.append("No additional open questions were generated.")
 
     lines.extend(["", "## Evidence", ""])
-    for item in report["evidence"]:  # type: ignore[union-attr]
+    for item in report["evidence"]:  # type: ignore[attr-defined]
         anchor = _evidence_anchor(item["evidence_id"])
         lines.extend(
             [
@@ -596,7 +548,7 @@ def _markdown_finding(finding: Mapping[str, object]) -> list[str]:
         f"- ID: `{finding['finding_id']}`",
         f"- Severity: **{str(finding['severity']).upper()}**",
         "- Affected resources: "
-        + ", ".join(f"`{item}`" for item in finding["affected_resource_ids"]),  # type: ignore[union-attr]
+        + ", ".join(f"`{item}`" for item in finding["affected_resource_ids"]),  # type: ignore[attr-defined]
         "- Evidence: " + _evidence_links(finding["evidence_ids"]),  # type: ignore[arg-type]
         "",
         _md(finding["description"]),

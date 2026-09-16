@@ -14,6 +14,8 @@ from cloudguard.bedrock_review import (
     BedrockReview,
     BedrockReviewResult,
     BedrockReviewStatus,
+    PrioritizedFinding,
+    ReviewPriority,
 )
 from cloudguard.evidence import EvidenceAggregator
 from cloudguard.iac import IaCDocument, IaCInput
@@ -50,18 +52,26 @@ class ContextProvider:
 
 
 class SuccessfulAIProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+
     def review(self, evidence_package):
+        self.calls += 1
+        finding = evidence_package.findings[0]
+        evidence = evidence_package.evidence[0]
         review = BedrockReview(
-            "1.0",
+            "2.0",
             evidence_package.package_id,
-            "The submitted architecture contains one database.",
-            (),
-            (),
-            (),
-            (),
-            (),
-            (),
-            (),
+            (
+                PrioritizedFinding(
+                    finding.finding_id,
+                    ReviewPriority.P0,
+                    "Review the cited deterministic finding first.",
+                    (evidence.evidence_id,),
+                    '"publicly_accessible":true',
+                    None,
+                ),
+            ),
         )
         return BedrockReviewResult(
             BedrockReviewStatus.SUCCEEDED,
@@ -249,13 +259,15 @@ class ReviewPipelineTests(unittest.TestCase):
         )
 
     def test_bedrock_disabled_keeps_deterministic_report(self) -> None:
-        result = self.pipeline(
-            bedrock_provider=SuccessfulAIProvider()
-        ).run(self.pipeline_input(enable_bedrock=False))
+        provider = SuccessfulAIProvider()
+        result = self.pipeline(bedrock_provider=provider).run(
+            self.pipeline_input(enable_bedrock=False)
+        )
 
         self.assertEqual(result.state, PipelineState.COMPLETED)
         self.assertIsNone(result.ai_interpretation)
         self.assertTrue(result.report.json_report["findings_by_pillar"])
+        self.assertEqual(provider.calls, 0)
 
     def test_bedrock_enabled_uses_mocked_validated_provider(self) -> None:
         result = self.pipeline(

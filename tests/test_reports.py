@@ -1,15 +1,12 @@
-from datetime import UTC, datetime
-from dataclasses import replace
 import json
 import unittest
+from dataclasses import replace
+from datetime import UTC, datetime
 
 from cloudguard.bedrock_review import (
     BedrockReview,
     PrioritizedFinding,
-    ReviewFact,
     ReviewPriority,
-    ReviewRemediation,
-    ReviewUncertainty,
 )
 from cloudguard.evidence import (
     AggregatedEvidenceItem,
@@ -19,7 +16,6 @@ from cloudguard.evidence import (
     EvidenceResource,
 )
 from cloudguard.reports import ReportGenerator
-
 
 NOW = datetime(2026, 9, 16, 12, 0, tzinfo=UTC)
 
@@ -95,45 +91,14 @@ def review() -> BedrockReview:
     return BedrockReview(
         schema_version="1.0",
         evidence_package_id="evidence-package.test",
-        architecture_summary=(
-            "One database is in scope. password=do-not-leak "
-            "AKIAABCDEFGHIJKLMNOP"
-        ),
-        architecture_summary_evidence_ids=("evidence.database",),
-        facts=(
-            ReviewFact(
-                "Public accessibility is enabled.",
-                '"publicly_accessible":true',
-                ("evidence.database",),
-                ("terraform.aws_db_instance.primary",),
-            ),
-        ),
-        architectural_implications=(),
         prioritized_findings=(
             PrioritizedFinding(
                 "finding.public-rds",
                 ReviewPriority.P0,
-                "Resolve public exposure first.",
+                "Resolve public exposure first. password=do-not-leak",
                 ("evidence.database",),
-            ),
-        ),
-        tradeoffs=(),
-        remediations=(
-            ReviewRemediation(
-                "Disable public accessibility",
-                "Use private connectivity. secret=do-not-leak",
-                ("finding.public-rds",),
-                ("evidence.database",),
-                "Private clients require network access.",
-                "Re-run the review.",
-            ),
-        ),
-        uncertainties=(
-            ReviewUncertainty(
-                "Security-group state is not included.",
-                ("Observed security-group rules",),
-                ("terraform.aws_db_instance.primary",),
-                ("evidence.database",),
+                '"publicly_accessible":true',
+                "Use private connectivity. AKIAABCDEFGHIJKLMNOP",
             ),
         ),
     )
@@ -202,24 +167,23 @@ class ReportGeneratorTests(unittest.TestCase):
 
     def test_rejects_review_for_another_package(self) -> None:
         mismatched = BedrockReview(
-            schema_version="1.0",
+            schema_version="2.0",
             evidence_package_id="evidence-package.other",
-            architecture_summary="Other package.",
-            architecture_summary_evidence_ids=(),
-            facts=(),
-            architectural_implications=(),
             prioritized_findings=(),
-            tradeoffs=(),
-            remediations=(),
-            uncertainties=(),
         )
         with self.assertRaisesRegex(ValueError, "does not match"):
             ReportGenerator().generate(package(), mismatched)
 
     def test_model_markdown_is_escaped(self) -> None:
+        reviewed = review().prioritized_findings[0]
         injected = replace(
             review(),
-            architecture_summary="[click](javascript:alert(1)) **important**",
+            prioritized_findings=(
+                replace(
+                    reviewed,
+                    recommendation="[click](javascript:alert(1)) **important**",
+                ),
+            ),
         )
 
         reports = ReportGenerator().generate(package(), injected)

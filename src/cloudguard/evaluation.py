@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Mapping
 
-from cloudguard.bedrock_review import ReviewOutputValidationError, validate_review_output
-from cloudguard.domain import AWSResource, Architecture, Evidence, EvidenceType
+from cloudguard.bedrock_review import (
+    ReviewOutputValidationError,
+    validate_review_output,
+)
+from cloudguard.domain import Architecture, AWSResource, Evidence, EvidenceType
 from cloudguard.evidence import EvidenceAggregator, EvidencePackage
 from cloudguard.rules import RuleEngine, RuleEngineConfig
 
@@ -63,7 +66,7 @@ def load_scenarios(path: Path) -> tuple[ArchitectureScenario, ...]:
     seen: set[str] = set()
     for index, raw in enumerate(payload):
         if not isinstance(raw, Mapping):
-            raise ValueError(f"scenario[{index}] must be an object")
+            raise TypeError(f"scenario[{index}] must be an object")
         scenario_id = _text(raw.get("id"), f"scenario[{index}].id")
         if scenario_id in seen:
             raise ValueError(f"duplicate scenario ID: {scenario_id}")
@@ -156,8 +159,6 @@ def evaluate_bedrock_output(
         validation_error = str(error)
 
     root = payload if isinstance(payload, Mapping) else {}
-    known_evidence = {item.evidence_id for item in evidence_package.evidence}
-    known_resources = {item.resource_id for item in evidence_package.resources}
     known_findings = {item.finding_id for item in evidence_package.findings}
     evidence_content = {
         item.evidence_id: json.dumps(
@@ -172,77 +173,49 @@ def evaluate_bedrock_output(
     unsupported = 0
     citation_checks: list[bool] = []
     grounding_checks: list[bool] = []
-    for section, evidence_key in (
-        ("facts", "evidence_ids"),
-        ("architectural_implications", "evidence_ids"),
-        ("prioritized_findings", "evidence_ids"),
-        ("tradeoffs", "evidence_ids"),
-        ("remediations", "evidence_ids"),
-    ):
-        for item in _objects(root.get(section)):
-            citations = _strings_or_empty(item.get(evidence_key))
-            citation_checks.append(bool(citations) and set(citations) <= known_evidence)
-            unsupported += len(set(citations) - known_evidence)
-
-    for fact in _objects(root.get("facts")):
-        citations = _strings_or_empty(fact.get("evidence_ids"))
-        resources = _strings_or_empty(fact.get("resource_ids"))
-        excerpt = fact.get("evidence_excerpt")
+    finding_evidence = {
+        item.finding_id: set(item.evidence_ids)
+        for item in evidence_package.findings
+    }
+    reviews = _objects(root.get("prioritized_findings"))
+    for item in reviews:
+        citations = _strings_or_empty(item.get("evidence_ids"))
+        finding_id = item.get("finding_id")
+        allowed = (
+            finding_evidence.get(finding_id, set())
+            if isinstance(finding_id, str)
+            else set()
+        )
+        citation_checks.append(bool(citations) and set(citations) <= allowed)
+        unsupported += len(set(citations) - allowed)
+        excerpt = item.get("evidence_excerpt")
         excerpt_supported = isinstance(excerpt, str) and any(
             excerpt in evidence_content.get(evidence_id, "") for evidence_id in citations
         )
         grounded = (
             bool(citations)
-            and set(citations) <= known_evidence
-            and bool(resources)
-            and set(resources) <= known_resources
+            and set(citations) <= allowed
             and excerpt_supported
         )
         grounding_checks.append(grounded)
-        unsupported += len(set(resources) - known_resources)
         if isinstance(excerpt, str) and not excerpt_supported:
             unsupported += 1
 
-    severity_by_finding = {
-        item.finding_id: item.severity for item in evidence_package.findings
-    }
-    allowed_priorities = {
-        "critical": {"P0"},
-        "high": {"P0", "P1"},
-        "medium": {"P1", "P2"},
-        "low": {"P2", "P3"},
-        "informational": {"P3"},
-    }
     severity_checks: list[bool] = []
-    for item in _objects(root.get("prioritized_findings")):
+    recommendation_checks: list[bool] = []
+    for item in reviews:
         finding_id = item.get("finding_id")
-        severity = severity_by_finding.get(finding_id) if isinstance(finding_id, str) else None
         severity_checks.append(
-            severity is not None and item.get("priority") in allowed_priorities[severity]
+            isinstance(finding_id, str)
+            and finding_id in known_findings
+            and item.get("review_priority") in {"P0", "P1", "P2", "P3"}
         )
         if isinstance(finding_id, str) and finding_id not in known_findings:
             unsupported += 1
-
-    recommendation_checks: list[bool] = []
-    for item in _objects(root.get("remediations")):
-        finding_ids = _strings_or_empty(item.get("finding_ids"))
-        evidence_ids = _strings_or_empty(item.get("evidence_ids"))
+        recommendation = item.get("recommendation")
         recommendation_checks.append(
-            bool(finding_ids)
-            and set(finding_ids) <= known_findings
-            and bool(evidence_ids)
-            and set(evidence_ids) <= known_evidence
-            and _minimum_text(item.get("action"), 20)
-            and _minimum_text(item.get("verification"), 10)
-            and _minimum_text(item.get("tradeoffs"), 10)
+            recommendation is None or _minimum_text(recommendation, 20)
         )
-        unsupported += len(set(finding_ids) - known_findings)
-
-    summary_citations = _strings_or_empty(root.get("architecture_summary_evidence_ids"))
-    citation_checks.append(
-        bool(summary_citations) and set(summary_citations) <= known_evidence
-    )
-    unsupported += len(set(summary_citations) - known_evidence)
 
     return BedrockEvaluation(
         schema_valid,
@@ -298,15 +271,20 @@ def render_regression_report(
     lines.extend(
         [
             "",
-            "The grounded reference case is a synthetic contract fixture, not a claim about "
-            "a particular foundation model. The adversarial case confirms unsupported IDs "
-            "and uncited configuration claims are detected.",
+            (
+                "The grounded reference case is a synthetic contract fixture, not a claim "
+                "about a particular foundation model. The adversarial case confirms "
+                "unsupported IDs and uncited configuration claims are detected."
+            ),
             "",
             "## Live Bedrock status",
             "",
-            "Not run. Model-specific quality and latency baselines require an explicitly "
-            "approved model ID, AWS credentials, region, and cost authorization. The same "
-            "grader can score captured JSON output without granting the model AWS access.",
+            (
+                "Not run. Model-specific quality and latency baselines require an explicitly "
+                "approved model ID, AWS credentials, region, and cost authorization. The "
+                "same grader can score captured JSON output without granting the model AWS "
+                "access."
+            ),
             "",
             "## Regression policy",
             "",
@@ -322,13 +300,13 @@ def render_regression_report(
 
 def _resource(scenario_id: str, index: int, raw: object) -> AWSResource:
     if not isinstance(raw, Mapping):
-        raise ValueError(f"{scenario_id}.resources[{index}] must be an object")
+        raise TypeError(f"{scenario_id}.resources[{index}] must be an object")
     resource_type = _text(raw.get("resource_type"), "resource_type")
     name = _text(raw.get("name"), "name")
     properties = raw.get("properties", {})
     tags = raw.get("tags", {})
     if not isinstance(properties, Mapping) or not isinstance(tags, Mapping):
-        raise ValueError("resource properties and tags must be objects")
+        raise TypeError("resource properties and tags must be objects")
     return AWSResource(
         id=f"terraform.{resource_type}.{name}",
         resource_type=resource_type,
