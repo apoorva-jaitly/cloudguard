@@ -1,0 +1,51 @@
+# Python environments and local configuration
+.venv/
+.env
+.env.*
+
+# CloudGuard runtime state and credentials
+.cloudguard/
+
+# AWS CLI/runtime credentials accidentally copied into the repository
+.aws/
+aws-credentials
+credentials.csv
+
+# Terraform local state and working data
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+crash.log
+crash.*.log
+
+# Python caches, test output, coverage, and type/lint caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+*.cover
+*.py,cover
+.mypy_cache/
+.ruff_cache/
+.tox/
+
+# Packaging and build output
+*.egg-info/
+build/
+dist/
+
+# Editors and operating systems
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
