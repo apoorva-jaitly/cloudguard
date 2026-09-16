@@ -10,7 +10,6 @@ from cloudguard.evaluation import (
     render_regression_report,
 )
 
-
 ROOT = Path(__file__).resolve().parents[1]
 SCENARIOS = ROOT / "evaluations" / "scenarios.json"
 
@@ -18,62 +17,19 @@ SCENARIOS = ROOT / "evaluations" / "scenarios.json"
 def grounded_output(package):
     finding = package.findings[0]
     evidence = package.evidence[0]
-    resource = package.resources[0]
     return {
-        "schema_version": "1.0",
+        "schema_version": "2.0",
         "evidence_package_id": package.package_id,
-        "architecture_summary": "The evidence identifies a publicly accessible database.",
-        "architecture_summary_evidence_ids": [evidence.evidence_id],
-        "facts": [
-            {
-                "statement": "Public accessibility is enabled.",
-                "evidence_excerpt": '"publicly_accessible":true',
-                "evidence_ids": [evidence.evidence_id],
-                "resource_ids": [resource.resource_id],
-            }
-        ],
-        "architectural_implications": [
-            {
-                "title": "Expanded exposure",
-                "interpretation": "The declared database exposure boundary is broader.",
-                "evidence_ids": [evidence.evidence_id],
-                "resource_ids": [resource.resource_id],
-                "confidence": 0.95,
-                "uncertainty": "Runtime network controls were not observed.",
-            }
-        ],
         "prioritized_findings": [
             {
                 "finding_id": finding.finding_id,
-                "priority": "P0",
+                "review_priority": "P0",
                 "rationale": "The deterministic finding is critical.",
                 "evidence_ids": [evidence.evidence_id],
-            }
-        ],
-        "tradeoffs": [
-            {
-                "decision": "Use private database connectivity.",
-                "benefits": ["Reduces public exposure."],
-                "costs_and_risks": ["Requires a private client network path."],
-                "evidence_ids": [evidence.evidence_id],
-            }
-        ],
-        "remediations": [
-            {
-                "title": "Disable public database access",
-                "action": "Set public accessibility to false and provide private connectivity.",
-                "finding_ids": [finding.finding_id],
-                "evidence_ids": [evidence.evidence_id],
-                "tradeoffs": "Clients need an approved private access path.",
-                "verification": "Re-run CloudGuard and verify the finding is absent.",
-            }
-        ],
-        "uncertainties": [
-            {
-                "description": "Observed runtime controls are unavailable.",
-                "missing_information": ["Current security-group and route state."],
-                "related_resource_ids": [resource.resource_id],
-                "related_evidence_ids": [evidence.evidence_id],
+                "evidence_excerpt": '"publicly_accessible":true',
+                "recommendation": (
+                    "Plan private connectivity before disabling public access."
+                ),
             }
         ],
     }
@@ -127,31 +83,28 @@ class EvaluationTests(unittest.TestCase):
 
     def test_unsupported_bedrock_claims_are_counted_and_rejected(self):
         payload = copy.deepcopy(grounded_output(self.package))
-        payload["facts"][0]["evidence_ids"] = ["evidence.invented"]
-        payload["facts"][0]["resource_ids"] = ["terraform.aws_db_instance.invented"]
-        payload["facts"][0]["evidence_excerpt"] = '"engine":"oracle"'
+        payload["prioritized_findings"][0]["evidence_ids"] = ["evidence.invented"]
+        payload["prioritized_findings"][0]["evidence_excerpt"] = '"engine":"oracle"'
         payload["prioritized_findings"][0]["finding_id"] = "finding.invented"
 
         result = evaluate_bedrock_output(payload, self.package)
 
         self.assertFalse(result.schema_valid)
         self.assertEqual(result.factual_grounding, 0.0)
-        self.assertGreaterEqual(result.unsupported_claims, 4)
+        self.assertGreaterEqual(result.unsupported_claims, 3)
 
-    def test_severity_inconsistency_is_detected(self):
+    def test_advisory_priority_does_not_need_to_match_severity(self):
         payload = grounded_output(self.package)
-        payload["prioritized_findings"][0]["priority"] = "P3"
+        payload["prioritized_findings"][0]["review_priority"] = "P3"
 
         result = evaluate_bedrock_output(payload, self.package)
 
         self.assertTrue(result.schema_valid)
-        self.assertEqual(result.severity_consistency, 0.0)
+        self.assertEqual(result.severity_consistency, 1.0)
 
     def test_weak_recommendation_is_scored_independently_of_schema(self):
         payload = grounded_output(self.package)
-        payload["remediations"][0]["action"] = "Fix it."
-        payload["remediations"][0]["tradeoffs"] = "None."
-        payload["remediations"][0]["verification"] = "Check."
+        payload["prioritized_findings"][0]["recommendation"] = "Fix it."
 
         result = evaluate_bedrock_output(payload, self.package)
 
