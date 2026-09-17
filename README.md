@@ -31,28 +31,24 @@ CloudGuard separates those responsibilities:
 ## Architecture
 
 ```mermaid
-flowchart LR
-    Client[Local API client] --> API[FastAPI boundary]
-    API --> Pipeline[Review pipeline]
-    Pipeline --> Adapter[Terraform IaC adapter]
-    Adapter --> Parser[Bounded non-executing parser]
-    Parser --> Architecture[Architecture and declared evidence]
+flowchart TD
+    Input[Terraform input] --> API[Local FastAPI]
+    API --> Parse[IaC adapter and parser]
+    Parse --> Facts[Architecture and normalized facts]
 
-    Architecture --> Facts[Normalized fact reconciliation]
-    AWS[Optional read-only AWS context] -. observed facts .-> Facts
-    Facts --> Rules[Deterministic rule engine]
+    AWS[Optional AWS context] -. observed facts .-> Facts
+    Facts --> Rules[Deterministic rules]
     Rules --> Findings[Authoritative findings]
 
-    Architecture --> Evidence[Bounded redacted evidence package]
-    Facts --> Evidence
+    Facts --> Evidence[Bounded evidence package]
     Findings --> Evidence
-    Evidence -. optional grounded context .-> Bedrock[Amazon Bedrock advisory review]
-    Evidence --> Reports[JSON and Markdown reports]
-    Bedrock -. validated priorities and recommendations .-> Reports
 
-    Pipeline --> Repository[SQLite lifecycle repository]
-    Reports --> Repository
-    API --> Repository
+    Evidence --> Review[Findings and reports]
+    Evidence -. grounded context .-> AI[Optional Bedrock review]
+    AI -. validated advice .-> Review
+
+    Review --> Store[SQLite repository]
+    Store --> Output[Authenticated API output]
 ```
 
 The default local API follows the solid path and does not configure the two
@@ -99,8 +95,8 @@ cache.
 Declared and observed facts are reconciled as agreement, conflict,
 declared-only, observed-only, or unknown. Existing rule policy continues to use
 declared Terraform state. Missing credentials, denied access, endpoint errors,
-and unmatched resources become diagnostics or unknown facts—not proof that a
-resource or control is absent.
+and unmatched resources become diagnostics or unknown facts. They are not
+proof that a resource or control is absent.
 
 ### Security Boundaries
 
