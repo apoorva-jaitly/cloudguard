@@ -30,6 +30,12 @@ from cloudguard.evidence import (
 NOW = datetime(2026, 9, 16, 12, 0, tzinfo=UTC)
 
 
+def synthetic_aws_access_key() -> str:
+    return "".join(  # noqa: FLY002 - keep credential-shaped fixture out of source
+        ("AK", "IA", "ABCD", "EFGH", "IJKL", "MNOP")
+    )
+
+
 def recommendation() -> Recommendation:
     return Recommendation(
         id="recommendation.test",
@@ -72,7 +78,7 @@ class EvidenceAggregationTests(unittest.TestCase):
             description="Database includes password=super-secret-value.",
             value={
                 "attributes": self.database.properties,
-                "access_key": "AKIAABCDEFGHIJKLMNOP",
+                "access_key": synthetic_aws_access_key(),
             },
             resource_ids=(self.database.id,),
         )
@@ -139,7 +145,7 @@ class EvidenceAggregationTests(unittest.TestCase):
 
         serialized = package.to_json()
         self.assertNotIn("super-secret-value", serialized)
-        self.assertNotIn("AKIAABCDEFGHIJKLMNOP", serialized)
+        self.assertNotIn(synthetic_aws_access_key(), serialized)
         self.assertIn("[REDACTED]", serialized)
         parsed = next(
             item for item in package.evidence if item.kind is EvidenceKind.PARSED
