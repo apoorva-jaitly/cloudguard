@@ -20,6 +20,12 @@ from cloudguard.reports import ReportGenerator
 NOW = datetime(2026, 9, 16, 12, 0, tzinfo=UTC)
 
 
+def synthetic_aws_access_key() -> str:
+    return "".join(  # noqa: FLY002 - keep credential-shaped fixture out of source
+        ("AK", "IA", "ABCD", "EFGH", "IJKL", "MNOP")
+    )
+
+
 def package(*, omit_evidence=False) -> EvidencePackage:
     evidence = (
         ()
@@ -98,7 +104,7 @@ def review() -> BedrockReview:
                 "Resolve public exposure first. password=do-not-leak",
                 ("evidence.database",),
                 '"publicly_accessible":true',
-                "Use private connectivity. AKIAABCDEFGHIJKLMNOP",
+                f"Use private connectivity. {synthetic_aws_access_key()}",
             ),
         ),
     )
@@ -144,7 +150,7 @@ class ReportGeneratorTests(unittest.TestCase):
 
         for output in (reports.json_text, reports.markdown):
             self.assertNotIn("do-not-leak", output)
-            self.assertNotIn("AKIAABCDEFGHIJKLMNOP", output)
+            self.assertNotIn(synthetic_aws_access_key(), output)
             self.assertIn("[REDACTED]", output)
 
     def test_omitted_evidence_gets_linkable_placeholder(self) -> None:
